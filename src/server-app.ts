@@ -60,7 +60,7 @@ export function resolveConfig(partial?: Partial<AppConfig>): AppConfig {
   return {
     dbPath: partial?.dbPath ?? process.env.REMIGLO_DB ?? "./data/remiglo.db",
     adminToken: partial?.adminToken ?? process.env.ADMIN_TOKEN,
-    appFeeBps: partial?.appFeeBps ?? Number(process.env.APP_FEE_BPS || 30),
+    appFeeBps: partial?.appFeeBps ?? Number(process.env.APP_FEE_BPS || 50),
     appFeeRecipient: partial?.appFeeRecipient ?? process.env.APP_FEE_RECIPIENT,
     pilotMaxPayoutUnits: partial?.pilotMaxPayoutUnits ?? process.env.PILOT_MAX_PAYOUT_UNITS ?? "100000000",
     approvalThresholdUnits: partial?.approvalThresholdUnits ?? process.env.APPROVAL_THRESHOLD_UNITS ?? "500000000",

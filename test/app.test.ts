@@ -318,9 +318,9 @@ describe("reconciliation and dashboard", () => {
     expect(res.headers["content-type"]).toContain("text/csv");
     const lines = res.body.trim().split("\n");
     expect(lines[0]).toBe("invoice_id,external_ref,gross,fee_estimate,net,settlement_asset,status,deposit_address,created_at");
-    // 30 bps of 10000000 is 30000; net 9970000
+    // 50 bps of 10000000 is 50000; net 9950000
     expect(lines[1]).toContain(inv.json().id);
-    expect(lines[1]).toContain("INV-1,10000000,30000,9970000");
+    expect(lines[1]).toContain("INV-1,10000000,50000,9950000");
     const daily = await h.app.inject({ method: "GET", url: "/v1/reconciliation/daily", headers: auth });
     expect(daily.json().invoicesByStatus.open).toBe(1);
   });

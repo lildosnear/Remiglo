@@ -230,8 +230,8 @@ describe("dashboard v2 pages", () => {
     const h = makeHarness();
     seedKnown(h);
     const res = await h.app.inject({ method: "GET", url: "/dashboard/analytics" , headers: await dashAuth(h)});
-    // fees: 30 bps on the two paid-side invoices of 10000000 each = 60000 units = $0.06
-    expect(res.body).toMatch(/Estimated fees earned<\/span><span class="stat-value">\$0\.06</);
+    // fees: 50 bps on the two paid-side invoices of 10000000 each = 100000 units = $0.10
+    expect(res.body).toMatch(/Estimated fees earned<\/span><span class="stat-value">\$0\.10</);
     // terminal: invoices paid, failed, overpaid (3) + payouts settled, failed (2) = 5; success 3 => 60.0%
     expect(res.body).toMatch(/Settlement success rate<\/span><span class="stat-value">60\.0%</);
     expect(res.body).toContain("Volume by day, last 30 days");
