@@ -1,0 +1,9 @@
+node_modules/
+dist/
+data/*
+!data/.gitkeep
+.env
+*.log
+# NEAR key files live here locally and are NEVER committed.
+keys/
+contracts/registry/target/
