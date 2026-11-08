@@ -39,6 +39,7 @@ body { margin: 0; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe 
 .layout { display: flex; min-height: 100vh; }
 .sidebar { width: 232px; flex: 0 0 232px; background: var(--navy); color: #fff; padding: 20px 0; position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; }
 .wordmark { font-size: 20px; font-weight: 700; letter-spacing: .2px; padding: 0 20px; }
+.brandlogo { width: 168px; display: block; margin: 2px 20px 6px; }
 .wordmark-sub { color: var(--sidebar-ink); font-size: 12px; padding: 2px 20px 18px; }
 .sidebar nav { display: flex; flex-direction: column; gap: 2px; padding: 0 10px; }
 .sidebar nav a { color: var(--sidebar-ink); text-decoration: none; padding: 8px 10px; border-radius: 6px; font-size: 13.5px; border-left: 3px solid transparent; }
@@ -150,7 +151,7 @@ export function shell(o: ShellOptions): string {
 <title>${esc(o.title)} · Remiglo</title><style>${CSS}</style></head>
 <body><div class="layout">
   <aside class="sidebar">
-    <div class="wordmark">Remiglo</div>
+    <img class="brandlogo" src="/brand/logo.png" alt="Remiglo">
     <div class="wordmark-sub">Business payments infrastructure</div>
     <nav>${nav}</nav>
     ${foot}

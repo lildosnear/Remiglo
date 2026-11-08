@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/remiglo-logo.png" alt="Remiglo" width="620"></p>
+
 # Remiglo
 
 A payment API for businesses to accept stablecoins, pay contractors, distribute funds and reconcile transactions across multiple chains, built on NEAR Intents.

@@ -1,4 +1,6 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import QRCode from "qrcode";
 import { feeEstimate, isAmountString, type Invoice, type Merchant, type PayoutBatch } from "./lib/core.js";
 import { Store, makeId, newWebhookSecret } from "./lib/store.js";
@@ -196,6 +198,16 @@ export function buildApp(options: BuildOptions = {}) {
 
   // The root path has no page of its own; send browsers to the dashboard.
   app.get("/", async (req, reply) => reply.redirect(303, "/dashboard"));
+
+  // Brand mark for the dashboard sidebar (assets/logo-lockup.png in the repo).
+  app.get("/brand/logo.png", async (req, reply) => {
+    try {
+      const buf = await readFile(join(process.cwd(), "assets", "logo-lockup.png"));
+      return reply.type("image/png").header("cache-control", "public, max-age=86400").send(buf);
+    } catch {
+      return reply.code(404).send({ error: "logo not found" });
+    }
+  });
 
   // ---- business dashboard (docs/DASHBOARD-DESIGN.md) ----
   // Accounts model (Slice F): while no dashboard users exist, the
