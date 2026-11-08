@@ -342,3 +342,100 @@ describe("dashboard v2 actions", () => {
     expect(setup.body).toContain("No merchant exists yet");
   });
 });
+
+describe("batch detail page", () => {
+  async function roleCookie(h: Harness, role: "owner" | "operator"): Promise<string> {
+    const merchant = h.store.listMerchants()[0];
+    const { salt, hash } = hashPassword("batch-detail-password-1");
+    const user = h.store.createUser({ merchantId: merchant.id, email: `${role}-batch@example.com`, passwordHash: hash, salt, role });
+    const token = newSessionToken();
+    h.store.createSession(user.id, hashToken(token), new Date(Date.now() + SESSION_TTL_MS).toISOString());
+    return `remiglo_session=${token}`;
+  }
+
+  function seedBatchRows(h: Harness): Seeded {
+    const s = seedKnown(h);
+    seedPayout(h.store, s.merchantId, { batchId: s.batchId, recipientAddress: "ama.near", amount: "40000000", status: "settled", amountOut: "39960000" });
+    seedPayout(h.store, s.merchantId, { batchId: s.batchId, recipientAddress: "tunde.near", amount: "40000000", status: "awaiting_funding", depositAddress: "mock_deposit_9" });
+    return s;
+  }
+
+  it("renders the summary, every row and the approval action for the owner", async () => {
+    const h = makeHarness();
+    const s = seedBatchRows(h);
+    const res = await h.app.inject({ method: "GET", url: `/dashboard/payouts/batches/${s.batchId}`, headers: { cookie: await roleCookie(h, "owner") } });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("<title>Payout batch · Remiglo</title>");
+    expect(res.body).toContain(s.batchId);
+    expect(res.body).toContain("ama.near");
+    expect(res.body).toContain("tunde.near");
+    expect(res.body).toContain("Settled so far");
+    expect(res.body).toContain("1 of 2 rows");
+    expect(res.body).toContain(`action="/dashboard/actions/batches/${s.batchId}/approve"`);
+    expect(res.body).toContain("Approve batch");
+    expect(res.body).toContain("On chain anchor");
+    expect(res.body).toContain("has not been recorded on chain");
+  });
+
+  it("shows the waiting note without approval actions for an operator", async () => {
+    const h = makeHarness();
+    const s = seedBatchRows(h);
+    const res = await h.app.inject({ method: "GET", url: `/dashboard/payouts/batches/${s.batchId}`, headers: { cookie: await roleCookie(h, "operator") } });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).not.toContain("Approve batch");
+    expect(res.body).toContain("cannot approve them");
+  });
+
+  it("shows the anchor transaction when the batch is anchored", async () => {
+    const h = makeHarness();
+    const s = seedKnown(h);
+    const anchored = h.store.createBatch({
+      id: uniq("batch"), merchantId: s.merchantId, status: "completed",
+      totalAmount: "40000000", rowCount: 1,
+      rows: [{ recipientAddress: "ama.near", destinationAsset: USDC_NEAR, amount: "40000000" }],
+      anchorTxHash: "AwffpTYN8yg1WntoF5nkJzkaC4BYkQb82grRd649bHN4", anchorStatus: "anchored",
+      createdAt: today(),
+    });
+    seedPayout(h.store, s.merchantId, { batchId: anchored.id, recipientAddress: "ama.near", amount: "40000000", status: "settled", amountOut: "39960000" });
+    const res = await h.app.inject({ method: "GET", url: `/dashboard/payouts/batches/${anchored.id}`, headers: { cookie: await roleCookie(h, "owner") } });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("AwffpTYN8yg1WntoF5nkJzkaC4BYkQb82grRd649bHN4");
+    expect(res.body).toContain("recorded on NEAR testnet");
+    expect(res.body).toContain("has been approved");
+  });
+
+  it("redirects to the payouts list for an unknown batch", async () => {
+    const h = makeHarness();
+    seedBatchRows(h);
+    const res = await h.app.inject({ method: "GET", url: "/dashboard/payouts/batches/batch_nope", headers: { cookie: await roleCookie(h, "owner") } });
+    expect(res.statusCode).toBe(303);
+    expect(res.headers.location).toContain("/dashboard/payouts");
+    expect(res.headers.location).toContain("was%20not%20found");
+  });
+
+  it("never shows a batch that belongs to another merchant", async () => {
+    const h = makeHarness();
+    const s = seedBatchRows(h);
+    const other = h.store.createMerchant({ name: "Other Biz", ...SETTLE });
+    const foreign = h.store.createBatch({
+      id: uniq("batch"), merchantId: other.merchant.id, status: "active",
+      totalAmount: "10000000", rowCount: 1,
+      rows: [{ recipientAddress: "x.near", destinationAsset: USDC_NEAR, amount: "10000000" }],
+      createdAt: today(),
+    });
+    const res = await h.app.inject({ method: "GET", url: `/dashboard/payouts/batches/${foreign.id}`, headers: { cookie: await roleCookie(h, "owner") } });
+    expect(res.statusCode).toBe(303);
+    expect(res.headers.location).toContain("/dashboard/payouts");
+    expect(s.merchantId).not.toBe(other.merchant.id);
+  });
+
+  it("links to the detail page from the payouts list and the overview approvals card", async () => {
+    const h = makeHarness();
+    const s = seedBatchRows(h);
+    const cookie = await roleCookie(h, "owner");
+    const list = await h.app.inject({ method: "GET", url: "/dashboard/payouts", headers: { cookie } });
+    expect(list.body).toContain(`/dashboard/payouts/batches/${s.batchId}`);
+    const overview = await h.app.inject({ method: "GET", url: "/dashboard", headers: { cookie } });
+    expect(overview.body).toContain(`/dashboard/payouts/batches/${s.batchId}`);
+  });
+});

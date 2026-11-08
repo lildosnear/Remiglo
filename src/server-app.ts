@@ -5,7 +5,7 @@ import QRCode from "qrcode";
 import { feeEstimate, isAmountString, type Invoice, type Merchant, type PayoutBatch } from "./lib/core.js";
 import { Store, makeId, newWebhookSecret } from "./lib/store.js";
 import {
-  pickMerchant, renderAnalytics, renderDevelopers, renderInvoices, renderLogin, renderNoMerchant,
+  pickMerchant, renderAnalytics, renderBatchDetail, renderDevelopers, renderInvoices, renderLogin, renderNoMerchant,
   renderOverview, renderPayments, renderPayouts, renderRecipients, renderReconciliation, renderRouting,
   renderSchedules, renderSettings, renderSetup,
   type DashData,
@@ -343,6 +343,15 @@ export function buildApp(options: BuildOptions = {}) {
     if (!m) return reply.type("text/html").send(renderNoMerchant("payouts", "Payouts"));
     const q = req.query as any;
     return reply.type("text/html").send(renderPayouts(dashData(m, req), { notice: q.notice, error: q.error }));
+  });
+
+  app.get("/dashboard/payouts/batches/:id", async (req, reply) => {
+    const m = dashMerchant(req);
+    if (!m) return reply.type("text/html").send(renderNoMerchant("payouts", "Payout batch"));
+    const batch = store.getBatch(m.id, (req.params as any).id as string);
+    if (!batch) return dashRedirect(reply, "/dashboard/payouts", { merchant: m.id, error: "That batch was not found for this business." });
+    const q = req.query as any;
+    return reply.type("text/html").send(renderBatchDetail(dashData(m, req), batch, { notice: q.notice, error: q.error }));
   });
 
   app.get("/dashboard/recipients", async (req, reply) => {

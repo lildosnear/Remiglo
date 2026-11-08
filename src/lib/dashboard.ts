@@ -5,7 +5,7 @@
  * same trust model as the v1 read only page. It never renders API
  * keys, key hashes, or webhook secrets.
  */
-import { feeEstimate, INVOICE_TERMINAL, PAYOUT_TERMINAL, type DashRole, type Invoice, type Merchant, type Payout } from "./core.js";
+import { feeEstimate, INVOICE_TERMINAL, PAYOUT_TERMINAL, type DashRole, type Invoice, type Merchant, type Payout, type PayoutBatch } from "./core.js";
 import type { Store } from "./store.js";
 import { builtinAsset, formatAmount, formatUnits, guessAsset, BUILTIN_ASSETS, type AssetInfo } from "./assets.js";
 import { barChartSvg, card, chip, donutSvg, esc, hBarSvg, htable, shell, statCard, type ShellOptions } from "./dashui.js";
@@ -209,7 +209,7 @@ export function renderOverview(d: DashData, q: { notice?: string; error?: string
     : htable(["Batch", "Rows", "Total", "Created", ""], pendingBatches.map((b) => {
       const firstAsset = String((b.rows[0] as any)?.destinationAsset ?? merchant.settlementAsset);
       return [
-        `<span class="mono">${esc(b.id)}</span>`, String(b.rowCount),
+        `<a href="/dashboard/payouts/batches/${esc(b.id)}?merchant=${esc(merchant.id)}"><span class="mono">${esc(b.id)}</span></a>`, String(b.rowCount),
         esc(formatAmount(b.totalAmount, info(firstAsset))), fmtDate(b.createdAt),
         canApprove
           ? `<form method="post" action="/dashboard/actions/batches/${esc(b.id)}/approve" style="margin:0"><button class="btn small" type="submit">Approve</button></form>`
@@ -285,15 +285,87 @@ export function renderPayouts(d: DashData, q: { notice?: string; error?: string 
   ${canCreate ? `<div id="send">${card("Send payout", form)}</div>\n  ${card("Upload a CSV batch", csvForm)}` : card("Send payout", READ_ONLY_NOTE)}
   ${card("Payout batches", htable(["Batch", "Status", "Rows", "Total", "Created"], batches.map((b) => {
     const firstAsset = String((b.rows[0] as any)?.destinationAsset ?? merchant.settlementAsset);
-    return [`<span class="mono">${esc(b.id)}</span>`, chip(b.status), String(b.rowCount), esc(formatAmount(b.totalAmount, info(firstAsset))), fmtDate(b.createdAt)];
+    return [`<a href="/dashboard/payouts/batches/${esc(b.id)}?merchant=${esc(merchant.id)}"><span class="mono">${esc(b.id)}</span></a>`, chip(b.status), String(b.rowCount), esc(formatAmount(b.totalAmount, info(firstAsset))), fmtDate(b.createdAt)];
   })))}
   ${card("Payouts", htable(["Payout", "Recipient", "Amount", "Status", "Batch", "Created"], payouts.map((p) => [
     `<span class="mono">${esc(short(p.id))}</span>`, `<span class="mono">${esc(short(p.recipientAddress, 30))}</span>`,
     esc(formatAmount(p.amount, info(p.originAsset))), chip(p.status),
-    p.batchId ? `<span class="mono">${esc(short(p.batchId))}</span>` : "—", fmtDate(p.createdAt),
+    p.batchId ? `<a href="/dashboard/payouts/batches/${esc(p.batchId)}?merchant=${esc(merchant.id)}"><span class="mono">${esc(short(p.batchId))}</span></a>` : "—", fmtDate(p.createdAt),
   ])))}`;
   return page(d, {
     active: "payouts", title: "Payouts", subtitle: `${merchant.name} · individual and bulk contractor payments`,
+    merchantName: merchant.name, content, ...banners(q),
+  });
+}
+
+/** One batch on its own page: summary, approval state, on chain anchor, every row, and the audit trail. */
+export function renderBatchDetail(d: DashData, batch: PayoutBatch, q: { notice?: string; error?: string } = {}): string {
+  const { store, merchant } = d;
+  const rows = store.listPayouts(merchant.id, batch.id);
+  const byAddress = new Map(store.listRecipients(merchant.id).map((r) => [`${r.address}|${r.assetId}`, r]));
+  const firstAsset = String((batch.rows[0] as any)?.destinationAsset ?? merchant.settlementAsset);
+  const settledRows = rows.filter((p) => p.status === "settled");
+  const settledTotal = settledRows.reduce((a, p) => a + BigInt(p.amount), 0n);
+
+  const summary = htable(["Field", "Value"], [
+    ["Batch", `<span class="mono">${esc(batch.id)}</span>`],
+    ["Status", chip(batch.status)],
+    ["Total", esc(formatAmount(batch.totalAmount, info(firstAsset)))],
+    ["Rows", String(batch.rowCount)],
+    ["Settled so far", `${settledRows.length} of ${rows.length} rows, ${esc(formatAmount(settledTotal.toString(), info(firstAsset)))}`],
+    ["Created", fmtDate(batch.createdAt)],
+    ["Last updated", fmtDate(batch.updatedAt ?? batch.createdAt)],
+  ]);
+
+  const canApprove = dashCan(d, "approve");
+  const approval = batch.status === "pending_approval"
+    ? (canApprove
+      ? `<p>This batch is over the approval threshold, so it is waiting before any money moves. Approving releases every row for quoting and funding.</p>
+         <form method="post" action="/dashboard/actions/batches/${esc(batch.id)}/approve" style="margin:0"><button class="btn" type="submit">Approve batch</button></form>`
+      : `<p>This batch is over the approval threshold and is waiting for approval. Your role can prepare batches but cannot approve them; an admin or the owner has to release it.</p>`)
+    : `<p>This batch has been approved. Its rows settle one by one, and the full history is in the activity below.</p>`;
+
+  const anchor = batch.anchorTxHash
+    ? `<p>This batch is recorded on NEAR testnet by the Remiglo registry contract, as a permanent audit record.</p>
+       <p style="margin:8px 0 0">Transaction<br><span class="mono" style="word-break:break-all">${esc(batch.anchorTxHash)}</span></p>`
+    : batch.anchorStatus === "pending"
+      ? `<p>The registry record for this batch is still being written to NEAR testnet.</p>`
+      : batch.anchorStatus === "failed"
+        ? `<p>The registry record for this batch failed to land. The payments themselves are unaffected, and the record can be written again from the API.</p>`
+        : `<p>This batch has not been recorded on chain. When the registry is configured on an instance, every batch is written to the registry contract as an audit record.</p>`;
+
+  const rowRows = rows.map((p) => {
+    const r = byAddress.get(`${p.recipientAddress}|${p.destinationAsset}`);
+    const ai = info(p.destinationAsset);
+    return [
+      `<span class="mono">${esc(short(p.id))}</span>`,
+      r ? `<strong>${esc(r.label)}</strong><br><span class="mono">${esc(short(p.recipientAddress, 30))}</span>` : `<span class="mono">${esc(short(p.recipientAddress, 30))}</span>`,
+      esc(`${ai.symbol} on ${ai.chainName}`),
+      esc(formatAmount(p.amount, info(p.originAsset))),
+      p.amountOut ? esc(formatAmount(p.amountOut, ai)) : "—",
+      chip(p.status),
+      p.depositAddress ? `<span class="mono">${esc(short(p.depositAddress, 24))}</span>` : "—",
+      fmtDate(p.createdAt),
+    ];
+  });
+
+  const entries = store.listLedger(merchant.id, batch.id).slice().reverse();
+  const activity = entries.length === 0
+    ? `<p class="empty">No activity recorded for this batch yet.</p>`
+    : htable(["When", "Event", "Amount", "Transaction"], entries.map((e) => [
+      fmtDate(e.createdAt), esc(e.kind), esc(formatAmount(e.amount, info(e.asset))),
+      e.txHash ? `<span class="mono">${esc(short(e.txHash, 24))}</span>` : "—",
+    ]));
+
+  const content = `
+  <p style="margin:0 0 14px"><a href="/dashboard/payouts?merchant=${esc(merchant.id)}">Back to payouts</a></p>
+  ${card("Batch summary", summary)}
+  ${card("Approval", approval)}
+  ${card("On chain anchor", anchor)}
+  ${card("Batch rows", rowRows.length ? htable(["Payout", "Recipient", "Destination", "Amount", "Received", "Status", "Deposit address", "Created"], rowRows) : `<p class="empty">This batch has no payout rows yet.</p>`)}
+  ${card("Activity", activity)}`;
+  return page(d, {
+    active: "payouts", title: "Payout batch", subtitle: `${merchant.name} · one batch, its rows and its audit trail`,
     merchantName: merchant.name, content, ...banners(q),
   });
 }
