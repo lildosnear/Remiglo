@@ -482,17 +482,18 @@ export function buildApp(options: BuildOptions = {}) {
   app.post("/dashboard/actions/batches/:id/approve", async (req, reply) => {
     if (!guardDashAction(req, reply, "approve")) return;
     const batch = store.getBatchById((req.params as any).id);
-    if (!batch) return dashRedirect(reply, "/dashboard", { error: "Batch not found." });
+    if (!batch) return dashRedirect(reply, "/dashboard/payouts", { error: "Batch not found." });
+    const detailPath = `/dashboard/payouts/batches/${batch.id}`;
     if (batch.status !== "pending_approval") {
-      return dashRedirect(reply, "/dashboard", { error: `Batch is ${batch.status}, not pending approval.` });
+      return dashRedirect(reply, detailPath, { merchant: batch.merchantId, error: `Batch is ${batch.status}, not pending approval.` });
     }
     const m = store.getMerchant(batch.merchantId);
-    if (!m) return dashRedirect(reply, "/dashboard", { error: "The merchant for this batch no longer exists." });
+    if (!m) return dashRedirect(reply, "/dashboard/payouts", { error: "The merchant for this batch no longer exists." });
     try {
       await approveBatchFor(m, batch);
-      return dashRedirect(reply, "/dashboard", { notice: "Batch approved. Its payouts are quoted and awaiting funding." });
+      return dashRedirect(reply, detailPath, { merchant: batch.merchantId, notice: "Batch approved. Its payouts are quoted and awaiting funding." });
     } catch (err) {
-      return dashRedirect(reply, "/dashboard", { error: `Approval failed: ${err instanceof Error ? err.message : String(err)}` });
+      return dashRedirect(reply, detailPath, { merchant: batch.merchantId, error: `Approval failed: ${err instanceof Error ? err.message : String(err)}` });
     }
   });
 

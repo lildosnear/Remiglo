@@ -429,6 +429,16 @@ describe("batch detail page", () => {
     expect(s.merchantId).not.toBe(other.merchant.id);
   });
 
+  it("sends the approver to the batch detail page after approving", async () => {
+    const h = makeHarness();
+    const s = seedBatchRows(h);
+    const res = await h.app.inject({ method: "POST", url: `/dashboard/actions/batches/${s.batchId}/approve`, headers: { cookie: await roleCookie(h, "owner") } });
+    expect(res.statusCode).toBe(303);
+    expect(res.headers.location).toContain(`/dashboard/payouts/batches/${s.batchId}`);
+    expect(res.headers.location).toContain("notice=");
+    expect(h.store.getBatchById(s.batchId)?.status).toBe("active");
+  });
+
   it("links to the detail page from the payouts list and the overview approvals card", async () => {
     const h = makeHarness();
     const s = seedBatchRows(h);
