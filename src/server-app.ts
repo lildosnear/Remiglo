@@ -194,6 +194,9 @@ export function buildApp(options: BuildOptions = {}) {
 
   app.get("/health", async () => ({ ok: true, service: "remiglo", version: "1.0.0" }));
 
+  // The root path has no page of its own; send browsers to the dashboard.
+  app.get("/", async (req, reply) => reply.redirect(303, "/dashboard"));
+
   // ---- business dashboard (docs/DASHBOARD-DESIGN.md) ----
   // Accounts model (Slice F): while no dashboard users exist, the
   // instance is in setup mode and pages redirect to /dashboard/setup.
