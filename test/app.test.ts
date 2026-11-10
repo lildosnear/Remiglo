@@ -366,3 +366,59 @@ describe("persistence", () => {
     expect(list.json()[0].id).toBe(inv.json().id);
   });
 });
+
+describe("payout retry", () => {
+  async function failedPayout(h: Harness) {
+    const { merchant, auth } = await makeMerchant(h);
+    const created = await h.app.inject({ method: "POST", url: "/v1/payouts", headers: auth, payload: { recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "25000000" } });
+    expect(created.statusCode).toBe(201);
+    const payout = created.json();
+    h.store.updatePayout(payout.id, { status: "failed" });
+    return { merchant, auth, payout };
+  }
+
+  it("retries a failed payout with a fresh quote, linked to the failed one", async () => {
+    const h = makeHarness();
+    const { auth, payout } = await failedPayout(h);
+    const res = await h.app.inject({ method: "POST", url: `/v1/payouts/${payout.id}/retry`, headers: auth });
+    expect(res.statusCode).toBe(201);
+    const retry = res.json();
+    expect(retry.id).not.toBe(payout.id);
+    expect(retry.status).toBe("awaiting_funding");
+    expect(retry.retryOfId).toBe(payout.id);
+    expect(retry.amount).toBe("25000000");
+    expect(retry.recipientAddress).toBe("ada.near");
+    expect(retry.depositAddress).toBeTruthy();
+    expect(h.store.getPayout(retry.merchantId, payout.id)?.status).toBe("failed");
+    expect(h.store.listRetriesOf(payout.id)).toHaveLength(1);
+  });
+
+  it("refuses a second retry while the first is in flight, and after it settles", async () => {
+    const h = makeHarness();
+    const { auth, payout } = await failedPayout(h);
+    const first = await h.app.inject({ method: "POST", url: `/v1/payouts/${payout.id}/retry`, headers: auth });
+    expect(first.statusCode).toBe(201);
+    const second = await h.app.inject({ method: "POST", url: `/v1/payouts/${payout.id}/retry`, headers: auth });
+    expect(second.statusCode).toBe(409);
+    expect(second.json().error).toContain("already in progress");
+    for (let i = 0; i < 6; i++) await sync(h);
+    expect(h.store.getPayout(first.json().merchantId, first.json().id)?.status).toBe("settled");
+    const third = await h.app.inject({ method: "POST", url: `/v1/payouts/${payout.id}/retry`, headers: auth });
+    expect(third.statusCode).toBe(409);
+    expect(third.json().error).toContain("already retried");
+  });
+
+  it("refuses to retry a payout that is not failed, and never crosses merchants", async () => {
+    const h = makeHarness();
+    const { auth, payout } = await failedPayout(h);
+    h.store.updatePayout(payout.id, { status: "settled" });
+    const res = await h.app.inject({ method: "POST", url: `/v1/payouts/${payout.id}/retry`, headers: auth });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toContain("only a failed payout");
+    const other = await makeMerchant(h, "Other");
+    const cross = await h.app.inject({ method: "POST", url: `/v1/payouts/${payout.id}/retry`, headers: other.auth });
+    expect(cross.statusCode).toBe(404);
+    const missing = await h.app.inject({ method: "POST", url: "/v1/payouts/pay_nope/retry", headers: auth });
+    expect(missing.statusCode).toBe(404);
+  });
+});

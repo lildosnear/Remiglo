@@ -449,3 +449,57 @@ describe("batch detail page", () => {
     expect(overview.body).toContain(`/dashboard/payouts/batches/${s.batchId}`);
   });
 });
+
+describe("batch row retry", () => {
+  async function sessionFor(h: Harness, role: "owner" | "operator" | "viewer"): Promise<string> {
+    const merchant = h.store.listMerchants()[0];
+    const { salt, hash } = hashPassword("retry-view-password-1");
+    const user = h.store.createUser({ merchantId: merchant.id, email: `${role}-retry@example.com`, passwordHash: hash, salt, role });
+    const token = newSessionToken();
+    h.store.createSession(user.id, hashToken(token), new Date(Date.now() + SESSION_TTL_MS).toISOString());
+    return `remiglo_session=${token}`;
+  }
+
+  function seedFailedBatch(h: Harness): Seeded & { failedPayoutId: string } {
+    const s = seedKnown(h);
+    seedPayout(h.store, s.merchantId, { batchId: s.batchId, recipientAddress: "ama.near", amount: "40000000", status: "settled", amountOut: "39960000" });
+    const failed = seedPayout(h.store, s.merchantId, { batchId: s.batchId, recipientAddress: "tunde.near", amount: "40000000", status: "failed" });
+    h.store.updateBatch(s.batchId, { status: "completed" });
+    return { ...s, failedPayoutId: failed.id };
+  }
+
+  it("shows the Retry row button on the failed row for the owner, and hides it from a viewer", async () => {
+    const h = makeHarness();
+    const s = seedFailedBatch(h);
+    const owner = await h.app.inject({ method: "GET", url: `/dashboard/payouts/batches/${s.batchId}`, headers: { cookie: await sessionFor(h, "owner") } });
+    expect(owner.statusCode).toBe(200);
+    expect(owner.body).toContain(`action="/dashboard/actions/payouts/${s.failedPayoutId}/retry"`);
+    expect(owner.body).toContain("Retry row");
+    const viewerCookie = await sessionFor(h, "viewer");
+    const viewer = await h.app.inject({ method: "GET", url: `/dashboard/payouts/batches/${s.batchId}`, headers: { cookie: viewerCookie } });
+    expect(viewer.statusCode).toBe(200);
+    expect(viewer.body).not.toContain("Retry row");
+    const denied = await h.app.inject({ method: "POST", url: `/dashboard/actions/payouts/${s.failedPayoutId}/retry`, headers: { cookie: viewerCookie } });
+    expect(denied.statusCode).toBe(403);
+  });
+
+  it("retrying reopens the batch, and the batch completes again when the retry settles", async () => {
+    const h = makeHarness();
+    const s = seedFailedBatch(h);
+    const cookie = await sessionFor(h, "owner");
+    const res = await h.app.inject({ method: "POST", url: `/dashboard/actions/payouts/${s.failedPayoutId}/retry`, headers: { cookie } });
+    expect(res.statusCode).toBe(303);
+    expect(res.headers.location).toContain(`/dashboard/payouts/batches/${s.batchId}`);
+    expect(h.store.getBatchById(s.batchId)?.status).toBe("active");
+    const retries = h.store.listRetriesOf(s.failedPayoutId);
+    expect(retries).toHaveLength(1);
+    expect(retries[0].status).toBe("awaiting_funding");
+    expect(retries[0].batchId).toBe(s.batchId);
+    expect(h.store.listLedger(s.merchantId, s.batchId).map((e) => e.kind)).toContain("row_retried");
+    const page = await h.app.inject({ method: "GET", url: `/dashboard/payouts/batches/${s.batchId}`, headers: { cookie } });
+    expect(page.body).toContain("retry of a failed row");
+    for (let i = 0; i < 6; i++) await h.app.inject({ method: "POST", url: "/v1/internal/sync" });
+    expect(h.store.getPayout(s.merchantId, retries[0].id)?.status).toBe("settled");
+    expect(h.store.getBatchById(s.batchId)?.status).toBe("completed");
+  });
+});

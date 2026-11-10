@@ -2,7 +2,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import QRCode from "qrcode";
-import { feeEstimate, isAmountString, type Invoice, type Merchant, type PayoutBatch } from "./lib/core.js";
+import { feeEstimate, isAmountString, PAYOUT_TERMINAL, type Invoice, type Merchant, type PayoutBatch } from "./lib/core.js";
 import { Store, makeId, newWebhookSecret } from "./lib/store.js";
 import {
   pickMerchant, renderAnalytics, renderBatchDetail, renderDevelopers, renderInvoices, renderLogin, renderNoMerchant,
@@ -22,7 +22,7 @@ import { getIntentsClient, MockIntents, type IntentsClient } from "./services/in
 import { NearRegistry, type RegistryClient } from "./services/registry.js";
 import { indexOnce, indexerStatus } from "./services/indexer.js";
 import { NearRpc } from "./services/nearTx.js";
-import type { PayoutRow } from "./lib/core.js";
+import type { Payout, PayoutRow } from "./lib/core.js";
 import { syncOnce } from "./services/poller.js";
 import { firstRunAt, type ScheduleServices } from "./services/schedules.js";
 import {
@@ -497,6 +497,21 @@ export function buildApp(options: BuildOptions = {}) {
     }
   });
 
+  app.post("/dashboard/actions/payouts/:id/retry", async (req, reply) => {
+    if (!guardDashAction(req, reply, "create")) return;
+    const m = dashMerchant(req);
+    if (!m) return dashRedirect(reply, "/dashboard/payouts", { error: "No merchant exists yet." });
+    const failed = store.getPayout(m.id, (req.params as any).id);
+    if (!failed) return dashRedirect(reply, "/dashboard/payouts", { merchant: m.id, error: "That payout was not found for this business." });
+    const backPath = failed.batchId ? `/dashboard/payouts/batches/${failed.batchId}` : "/dashboard/payouts";
+    try {
+      const payout = await retryPayoutFor(m, failed);
+      return dashRedirect(reply, backPath, { merchant: m.id, notice: `Retry created: payout ${payout.id} is quoted and awaiting funding.` });
+    } catch (err) {
+      return dashRedirect(reply, backPath, { merchant: m.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post("/dashboard/actions/payouts", async (req, reply) => {
     if (!guardDashAction(req, reply)) return;
     const m = dashMerchant(req);
@@ -876,7 +891,7 @@ export function buildApp(options: BuildOptions = {}) {
   };
 
   // ---- payouts ----
-  const createPayoutFor = async (m: Merchant, row: any, batchId?: string, idem?: string) => {
+  const createPayoutFor = async (m: Merchant, row: any, batchId?: string, idem?: string, retryOf?: string) => {
     const amount = String(row.amount);
     const q = await intents.quote({
       dry: false, originAsset: row.originAsset ?? row.destinationAsset, destinationAsset: row.destinationAsset,
@@ -888,9 +903,45 @@ export function buildApp(options: BuildOptions = {}) {
       destinationAsset: row.destinationAsset, originAsset: row.originAsset ?? row.destinationAsset,
       refundTo: row.refundTo ?? m.refundTo, amount, status: "awaiting_funding",
       depositAddress: q.quote.depositAddress, amountOut: q.quote.amountOut,
-      idempotencyKey: batchId ? undefined : idem, createdAt: new Date().toISOString(),
+      idempotencyKey: batchId ? undefined : idem, retryOfId: retryOf, createdAt: new Date().toISOString(),
     });
     store.addLedger({ merchantId: m.id, entityType: "payout", entityId: payout.id, kind: "payout_quoted", amount, asset: row.destinationAsset });
+    return payout;
+  };
+
+  /** A retry the product refuses, with the HTTP status the API should answer. */
+  class RetryRefused extends Error {
+    constructor(message: string, readonly httpStatus = 409) { super(message); }
+  }
+
+  /**
+   * The one payout retry path. Only a failed payout can be retried. The
+   * retry is a fresh quote and a new payout linked to the failed one,
+   * in the same batch when there is one; the failed row stays in the
+   * record and settled rows are never touched. A second retry is
+   * refused while one is in flight or has already settled, so a row
+   * can never be paid twice by retrying.
+   */
+  const retryPayoutFor = async (m: Merchant, failed: Payout) => {
+    if (failed.status !== "failed") {
+      throw new RetryRefused(`only a failed payout can be retried; this payout is ${failed.status}`);
+    }
+    const retries = store.listRetriesOf(failed.id);
+    if (retries.some((r) => r.status === "settled")) {
+      throw new RetryRefused("this payout was already retried and the retry settled");
+    }
+    if (retries.some((r) => !PAYOUT_TERMINAL.includes(r.status))) {
+      throw new RetryRefused("a retry of this payout is already in progress");
+    }
+    const payout = await createPayoutFor(m, {
+      recipientAddress: failed.recipientAddress, destinationAsset: failed.destinationAsset,
+      originAsset: failed.originAsset, refundTo: failed.refundTo, amount: failed.amount,
+    }, failed.batchId, undefined, failed.id);
+    if (failed.batchId) {
+      store.addLedger({ merchantId: m.id, entityType: "batch", entityId: failed.batchId, kind: "row_retried", amount: failed.amount, asset: failed.destinationAsset });
+      const batch = store.getBatchById(failed.batchId);
+      if (batch && batch.status === "completed") store.updateBatch(batch.id, { status: "active" });
+    }
     return payout;
   };
 
@@ -927,6 +978,19 @@ export function buildApp(options: BuildOptions = {}) {
     const p = store.getPayout(req.merchant!.id, (req.params as any).id);
     if (!p) return reply.code(404).send({ error: "payout not found" });
     return p;
+  });
+
+  app.post("/v1/payouts/:id/retry", async (req, reply) => {
+    const m = req.merchant!;
+    const failed = store.getPayout(m.id, (req.params as any).id);
+    if (!failed) return reply.code(404).send({ error: "payout not found" });
+    try {
+      const payout = await retryPayoutFor(m, failed);
+      return reply.code(201).send(payout);
+    } catch (err) {
+      if (err instanceof RetryRefused) return reply.code(err.httpStatus).send({ error: err.message });
+      return reply.code(502).send({ error: `quote failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
   });
 
   // ---- payout batches ----

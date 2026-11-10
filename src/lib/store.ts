@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS payouts (
   id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, batch_id TEXT,
   recipient_address TEXT NOT NULL, destination_asset TEXT NOT NULL, origin_asset TEXT NOT NULL,
   refund_to TEXT, amount TEXT NOT NULL, status TEXT NOT NULL, deposit_address TEXT,
-  amount_out TEXT, idempotency_key TEXT, created_at TEXT NOT NULL, updated_at TEXT
+  amount_out TEXT, idempotency_key TEXT, retry_of TEXT, created_at TEXT NOT NULL, updated_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payout_idem ON payouts(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS payout_batches (
@@ -131,6 +131,11 @@ export class Store {
     }
     if (!batchCols.some((c) => c.name === "anchor_status")) {
       this.db.exec("ALTER TABLE payout_batches ADD COLUMN anchor_status TEXT");
+    }
+    // Migration for databases created before payout retries existed.
+    const payoutCols = this.db.prepare("PRAGMA table_info(payouts)").all() as Array<{ name: string }>;
+    if (!payoutCols.some((c) => c.name === "retry_of")) {
+      this.db.exec("ALTER TABLE payouts ADD COLUMN retry_of TEXT");
     }
   }
 
@@ -311,12 +316,18 @@ export class Store {
 
   // ---- payouts and batches ----
   createPayout(p: Payout) {
-    this.db.prepare(`INSERT INTO payouts (id,merchant_id,batch_id,recipient_address,destination_asset,origin_asset,refund_to,amount,status,deposit_address,amount_out,idempotency_key,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    this.db.prepare(`INSERT INTO payouts (id,merchant_id,batch_id,recipient_address,destination_asset,origin_asset,refund_to,amount,status,deposit_address,amount_out,idempotency_key,retry_of,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(p.id, p.merchantId, p.batchId ?? null, p.recipientAddress, p.destinationAsset, p.originAsset,
         p.refundTo ?? null, p.amount, p.status, p.depositAddress ?? null, p.amountOut ?? null,
-        p.idempotencyKey ?? null, p.createdAt, p.createdAt);
+        p.idempotencyKey ?? null, p.retryOfId ?? null, p.createdAt, p.createdAt);
     return p;
+  }
+
+  /** Every payout created by retrying the given payout, oldest first. */
+  listRetriesOf(payoutId: string): Payout[] {
+    const rows = this.db.prepare("SELECT * FROM payouts WHERE retry_of = ? ORDER BY created_at").all(payoutId) as any[];
+    return rows.map((r) => this.rowPayout(r));
   }
 
   getPayout(merchantId: string, id: string): Payout | undefined {
@@ -355,6 +366,7 @@ export class Store {
       destinationAsset: r.destination_asset, originAsset: r.origin_asset, refundTo: r.refund_to ?? undefined,
       amount: r.amount, status: r.status, depositAddress: r.deposit_address ?? undefined,
       amountOut: r.amount_out ?? undefined, idempotencyKey: r.idempotency_key ?? undefined,
+      retryOfId: r.retry_of ?? undefined,
       createdAt: r.created_at, updatedAt: r.updated_at ?? undefined,
     };
   }

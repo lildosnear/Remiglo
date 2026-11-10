@@ -52,6 +52,8 @@ export interface Payout {
   depositAddress?: string;
   amountOut?: string;
   idempotencyKey?: string;
+  /** Set on a payout created by retrying a failed one: the failed payout's id. */
+  retryOfId?: string;
   createdAt: string;
   updatedAt?: string;
 }

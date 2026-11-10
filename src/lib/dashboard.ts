@@ -334,11 +334,12 @@ export function renderBatchDetail(d: DashData, batch: PayoutBatch, q: { notice?:
         ? `<p>The registry record for this batch failed to land. The payments themselves are unaffected, and the record can be written again from the API.</p>`
         : `<p>This batch has not been recorded on chain. When the registry is configured on an instance, every batch is written to the registry contract as an audit record.</p>`;
 
+  const canCreate = dashCan(d, "create");
   const rowRows = rows.map((p) => {
     const r = byAddress.get(`${p.recipientAddress}|${p.destinationAsset}`);
     const ai = info(p.destinationAsset);
     return [
-      `<span class="mono">${esc(short(p.id))}</span>`,
+      `<span class="mono">${esc(short(p.id))}</span>${p.retryOfId ? `<br><span style="color:#5b6b82;font-size:12px">retry of a failed row</span>` : ""}`,
       r ? `<strong>${esc(r.label)}</strong><br><span class="mono">${esc(short(p.recipientAddress, 30))}</span>` : `<span class="mono">${esc(short(p.recipientAddress, 30))}</span>`,
       esc(`${ai.symbol} on ${ai.chainName}`),
       esc(formatAmount(p.amount, info(p.originAsset))),
@@ -346,6 +347,9 @@ export function renderBatchDetail(d: DashData, batch: PayoutBatch, q: { notice?:
       chip(p.status),
       p.depositAddress ? `<span class="mono">${esc(short(p.depositAddress, 24))}</span>` : "—",
       fmtDate(p.createdAt),
+      p.status === "failed" && canCreate
+        ? `<form method="post" action="/dashboard/actions/payouts/${esc(p.id)}/retry" style="margin:0"><button class="btn small" type="submit">Retry row</button></form>`
+        : "—",
     ];
   });
 
@@ -362,7 +366,7 @@ export function renderBatchDetail(d: DashData, batch: PayoutBatch, q: { notice?:
   ${card("Batch summary", summary)}
   ${card("Approval", approval)}
   ${card("On chain anchor", anchor)}
-  ${card("Batch rows", rowRows.length ? htable(["Payout", "Recipient", "Destination", "Amount", "Received", "Status", "Deposit address", "Created"], rowRows) : `<p class="empty">This batch has no payout rows yet.</p>`)}
+  ${card("Batch rows", rowRows.length ? htable(["Payout", "Recipient", "Destination", "Amount", "Received", "Status", "Deposit address", "Created", "Action"], rowRows) : `<p class="empty">This batch has no payout rows yet.</p>`)}
   ${card("Activity", activity)}`;
   return page(d, {
     active: "payouts", title: "Payout batch", subtitle: `${merchant.name} · one batch, its rows and its audit trail`,
