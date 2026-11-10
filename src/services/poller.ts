@@ -126,11 +126,15 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncResult> {
         kind: `payout_${mapped}`, amount: st.swapDetails?.amountOut ?? pay.amount,
         asset: pay.destinationAsset, txHash,
       });
+      const refData = {
+        ...(pay.reference ? { reference: pay.reference } : {}),
+        ...(pay.grossAmount ? { grossAmount: pay.grossAmount, retentionAmount: pay.retentionAmount, deductionsAmount: pay.deductionsAmount } : {}),
+      };
       if (PAYOUT_SENT_FROM.includes(pay.status) && PAYOUT_SENT_TO.includes(mapped)) {
-        enqueueEvent(store, pay.merchantId, "payout.sent", pay.id, { payoutId: pay.id, status: mapped, batchId: pay.batchId });
+        enqueueEvent(store, pay.merchantId, "payout.sent", pay.id, { payoutId: pay.id, status: mapped, batchId: pay.batchId, ...refData });
       }
       const event = PAYOUT_EVENT[mapped];
-      if (event) enqueueEvent(store, pay.merchantId, event, pay.id, { payoutId: pay.id, status: mapped, batchId: pay.batchId });
+      if (event) enqueueEvent(store, pay.merchantId, event, pay.id, { payoutId: pay.id, status: mapped, batchId: pay.batchId, ...refData });
       if (pay.batchId) touchedBatches.add(pay.batchId);
       result.payoutsUpdated += 1;
     } catch {

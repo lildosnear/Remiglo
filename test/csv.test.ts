@@ -152,3 +152,31 @@ describe("payout.sent webhook event", () => {
     expect(settled).toHaveLength(1);
   });
 });
+
+describe("batch CSV reference and breakdown columns", () => {
+  it("parses the full optional column set into row fields", () => {
+    const text = [
+      "recipient_address,destination_asset,amount_units,reference,gross_amount_units,retention_amount_units,deductions_amount_units",
+      `ada.near,${USDC_NEAR},85000000,INV-2041,100000000,10000000,5000000`,
+      `bob.near,${USDC_NEAR},25000000,,,,`,
+    ].join("\n");
+    const parsed = parseBatchCsv(text);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.rows).toHaveLength(2);
+    expect(parsed.rows![0]).toMatchObject({ reference: "INV-2041", grossAmount: "100000000", retentionAmount: "10000000", deductionsAmount: "5000000", amount: "85000000" });
+    expect(parsed.rows![1]).not.toHaveProperty("grossAmount");
+    expect(parsed.rows![1]).not.toHaveProperty("reference");
+  });
+
+  it("rejects out of order optional columns and bad breakdown units with line numbers", () => {
+    const wrongOrder = parseBatchCsv(`recipient_id,amount_units,gross_amount_units,reference\nrcpt_1,100,200,INV-1`);
+    expect(wrongOrder.rows).toBeUndefined();
+    expect(wrongOrder.errors[0].line).toBe(1);
+    const badUnits = parseBatchCsv([
+      "recipient_address,destination_asset,amount_units,reference,gross_amount_units",
+      `ada.near,${USDC_NEAR},100,INV-1,10.5`,
+    ].join("\n"));
+    expect(badUnits.rows).toBeUndefined();
+    expect(badUnits.errors[0].line).toBe(2);
+  });
+});

@@ -94,6 +94,8 @@ ada.near,nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1
 
 Every row is validated before anything is created: one bad row returns per row errors with line numbers and creates nothing. Batches over the approval threshold (default 500 USDC) wait in `pending_approval` until `POST /v1/payout-batches/:id/approve`. Rows can also reference a saved recipient with `recipient_id,amount_units` headers, and recipients are managed at `/v1/recipients` (the dashboard Recipients page is the same address book).
 
+A payout row can carry the payer's own reference and a certified breakdown, in JSON (`reference`, `grossAmount`, `retentionAmount`, `deductionsAmount`) or as trailing CSV columns (`reference,gross_amount_units,retention_amount_units,deductions_amount_units`, in that order). The amount on the row is the net that moves; when a gross amount is given, the server checks that net equals gross minus retention minus deductions and rejects the row when it does not. The reference and all four figures are stored on the payout, shown on the batch page, included in payout webhooks, and exported per payout at `GET /v1/reconciliation/payouts.csv`, so a payment can be matched back to its approved invoice, retention and deductions without a spreadsheet.
+
 ## 7. Create a recurring schedule
 
 ```bash
@@ -169,12 +171,12 @@ Chain Signatures stays inert unless `CHAIN_SIG_ENABLED=1` with `CHAIN_SIG_KEY_FI
 
 - Merchants: `POST /v1/merchants` (admin token when `ADMIN_TOKEN` is set; API key returned once).
 - Invoices: `POST|GET /v1/invoices`, `GET /v1/invoices/:id`, `POST /v1/invoices/:id/cancel`. Send an `Idempotency-Key` header to make creation safe to retry.
-- Payouts: `POST|GET /v1/payouts`, `GET /v1/payouts/:id`.
+- Payouts: `POST|GET /v1/payouts`, `GET /v1/payouts/:id`, `POST /v1/payouts/:id/retry` (a failed payout only; the retry is a fresh quote linked to the failed payout).
 - Batches: `POST|GET /v1/payout-batches` (JSON rows or raw `text/csv`), `GET /v1/payout-batches/:id`, `POST /v1/payout-batches/:id/approve`.
 - Recipients: `POST|GET /v1/recipients`, `GET|PATCH|DELETE /v1/recipients/:id`.
 - Schedules: `POST|GET /v1/schedules`, `GET /v1/schedules/:id` (includes runs), `PATCH`, `POST /:id/pause`, `POST /:id/resume`, `DELETE`.
 - Webhooks: `POST|GET /v1/webhook-endpoints` (secret returned once), `GET /v1/webhook-deliveries`, `POST /v1/webhook-deliveries/:id/replay`. Deliveries are HMAC SHA256 signed in the `x-remiglo-signature` header, retried up to 5 times with doubling backoff.
-- Reconciliation: `GET /v1/ledger`, `GET /v1/reconciliation/daily`, `GET /v1/reconciliation/export.csv`.
+- Reconciliation: `GET /v1/ledger`, `GET /v1/reconciliation/daily`, `GET /v1/reconciliation/export.csv` (per invoice), `GET /v1/reconciliation/payouts.csv` (per payout, with reference, gross, retention, deductions and net).
 - Internal: `POST /v1/internal/sync` (one poller cycle), `GET /v1/internal/indexer/status`. Localhost or admin token only.
 - Pages: `GET /dashboard` (login required after setup), `GET /pay/:invoiceId` (public payment page), `GET /health`.
 

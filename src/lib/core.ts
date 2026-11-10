@@ -37,6 +37,10 @@ export interface PayoutRow {
   destinationAsset: string;
   amount: string;
   reference?: string;
+  /** Optional certified breakdown: amount (the net that moves) must equal grossAmount - retentionAmount - deductionsAmount. */
+  grossAmount?: string;
+  retentionAmount?: string;
+  deductionsAmount?: string;
 }
 
 export interface Payout {
@@ -54,6 +58,12 @@ export interface Payout {
   idempotencyKey?: string;
   /** Set on a payout created by retrying a failed one: the failed payout's id. */
   retryOfId?: string;
+  /** The payer's own reference for this payment, such as an approved invoice or certificate number. */
+  reference?: string;
+  /** Optional certified breakdown behind the net amount: gross, retention held back, other deductions. */
+  grossAmount?: string;
+  retentionAmount?: string;
+  deductionsAmount?: string;
   createdAt: string;
   updatedAt?: string;
 }

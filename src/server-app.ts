@@ -523,7 +523,16 @@ export function buildApp(options: BuildOptions = {}) {
     const destInfo = builtinAsset(String(b.destinationAsset)) ?? guessAsset(String(b.destinationAsset));
     const units = parseDecimalToUnits(String(b.amount ?? ""), destInfo.decimals);
     if (!units) return back({ error: "Amount must be a positive number this asset supports." });
-    const row = { recipientAddress: String(b.recipientAddress), destinationAsset: String(b.destinationAsset), amount: units };
+    const row: any = { recipientAddress: String(b.recipientAddress), destinationAsset: String(b.destinationAsset), amount: units };
+    if (b.reference && String(b.reference).trim()) row.reference = String(b.reference).trim();
+    for (const [field, key] of [["grossAmount", "grossAmount"], ["retentionAmount", "retentionAmount"], ["deductionsAmount", "deductionsAmount"]] as const) {
+      const raw = b[field];
+      if (raw !== undefined && String(raw).trim() !== "") {
+        const parsed = parseDecimalToUnits(String(raw), destInfo.decimals);
+        if (parsed === null) return back({ error: "Gross, retention and deductions must be numbers this asset supports." });
+        row[key] = parsed;
+      }
+    }
     const problem = validPayoutRow(row);
     if (problem) return back({ error: problem });
     try {
@@ -898,12 +907,17 @@ export function buildApp(options: BuildOptions = {}) {
       amount, recipient: row.recipientAddress, refundTo: row.refundTo ?? m.refundTo,
       appFeeBps: cfg.appFeeBps, appFeeRecipient: cfg.appFeeRecipient,
     });
+    const hasGross = row.grossAmount !== undefined && row.grossAmount !== null && row.grossAmount !== "";
     const payout = store.createPayout({
       id: makeId("pay"), merchantId: m.id, batchId, recipientAddress: row.recipientAddress,
       destinationAsset: row.destinationAsset, originAsset: row.originAsset ?? row.destinationAsset,
       refundTo: row.refundTo ?? m.refundTo, amount, status: "awaiting_funding",
       depositAddress: q.quote.depositAddress, amountOut: q.quote.amountOut,
       idempotencyKey: batchId ? undefined : idem, retryOfId: retryOf, createdAt: new Date().toISOString(),
+      reference: row.reference ? String(row.reference).trim() : undefined,
+      grossAmount: hasGross ? String(row.grossAmount) : undefined,
+      retentionAmount: hasGross ? String(row.retentionAmount ?? "0") || "0" : undefined,
+      deductionsAmount: hasGross ? String(row.deductionsAmount ?? "0") || "0" : undefined,
     });
     store.addLedger({ merchantId: m.id, entityType: "payout", entityId: payout.id, kind: "payout_quoted", amount, asset: row.destinationAsset });
     return payout;
@@ -936,6 +950,8 @@ export function buildApp(options: BuildOptions = {}) {
     const payout = await createPayoutFor(m, {
       recipientAddress: failed.recipientAddress, destinationAsset: failed.destinationAsset,
       originAsset: failed.originAsset, refundTo: failed.refundTo, amount: failed.amount,
+      reference: failed.reference, grossAmount: failed.grossAmount,
+      retentionAmount: failed.retentionAmount, deductionsAmount: failed.deductionsAmount,
     }, failed.batchId, undefined, failed.id);
     if (failed.batchId) {
       store.addLedger({ merchantId: m.id, entityType: "batch", entityId: failed.batchId, kind: "row_retried", amount: failed.amount, asset: failed.destinationAsset });
@@ -949,6 +965,31 @@ export function buildApp(options: BuildOptions = {}) {
     if (!row?.recipientAddress || !row?.destinationAsset) return "each payout needs recipientAddress and destinationAsset";
     if (!isAmountString(String(row.amount ?? ""))) return "each payout amount must be a positive integer string in smallest units";
     if (BigInt(String(row.amount)) > BigInt(cfg.pilotMaxPayoutUnits)) return "a payout amount exceeds the pilot cap";
+    if (row.reference !== undefined && row.reference !== null && row.reference !== "") {
+      if (typeof row.reference !== "string" || row.reference.trim().length === 0 || row.reference.trim().length > 120) {
+        return "a payout reference must be a string of 1 to 120 characters";
+      }
+    }
+    const hasBreakdown = ["grossAmount", "retentionAmount", "deductionsAmount"]
+      .some((k) => row[k] !== undefined && row[k] !== null && row[k] !== "");
+    if (hasBreakdown) {
+      if (row.grossAmount === undefined || row.grossAmount === null || row.grossAmount === "") {
+        return "a gross amount is required when retention or deductions are given";
+      }
+      for (const k of ["grossAmount", "retentionAmount", "deductionsAmount"]) {
+        const v = row[k];
+        if (v !== undefined && v !== null && v !== "" && !/^[0-9]+$/.test(String(v))) {
+          return "gross, retention and deductions amounts must be integer strings in smallest units";
+        }
+      }
+      const gross = BigInt(String(row.grossAmount));
+      if (gross <= 0n) return "the gross amount must be positive";
+      const retention = BigInt(String(row.retentionAmount ?? "0") || "0");
+      const deductions = BigInt(String(row.deductionsAmount ?? "0") || "0");
+      if (gross - retention - deductions !== BigInt(String(row.amount))) {
+        return "the payout amount must equal the gross amount minus retention and deductions";
+      }
+    }
     return undefined;
   };
 
@@ -1121,6 +1162,18 @@ export function buildApp(options: BuildOptions = {}) {
       return cells.map((c) => (/[",\n]/.test(c) ? `"${c.replace(/"/g, '""')}"` : c)).join(",");
     });
     reply.type("text/csv").header("content-disposition", "attachment; filename=remiglo-reconciliation.csv")
+      .send([head, ...lines].join("\n") + "\n");
+  });
+
+  app.get("/v1/reconciliation/payouts.csv", async (req, reply) => {
+    const m = req.merchant!;
+    const head = "payout_id,batch_id,recipient_address,reference,gross_amount,retention_amount,deductions_amount,net_amount,amount_received,destination_asset,status,deposit_address,created_at";
+    const esc = (c: string) => (/[",\n]/.test(c) ? `"${c.replace(/"/g, '""')}"` : c);
+    const lines = store.listPayouts(m.id).map((p) => {
+      const cells = [p.id, p.batchId ?? "", p.recipientAddress, p.reference ?? "", p.grossAmount ?? "", p.retentionAmount ?? "", p.deductionsAmount ?? "", p.amount, p.amountOut ?? "", p.destinationAsset, p.status, p.depositAddress ?? "", p.createdAt];
+      return cells.map(esc).join(",");
+    });
+    reply.type("text/csv").header("content-disposition", "attachment; filename=remiglo-payouts.csv")
       .send([head, ...lines].join("\n") + "\n");
   });
 

@@ -422,3 +422,59 @@ describe("payout retry", () => {
     expect(missing.statusCode).toBe(404);
   });
 });
+
+describe("payout references and breakdown", () => {
+  const BREAKDOWN = { reference: "INV-2041", grossAmount: "100000000", retentionAmount: "10000000", deductionsAmount: "5000000" };
+
+  it("stores the reference and breakdown on the payout, and the net must reconcile", async () => {
+    const h = makeHarness();
+    const { auth } = await makeMerchant(h);
+    const ok = await h.app.inject({ method: "POST", url: "/v1/payouts", headers: auth, payload: { recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "85000000", ...BREAKDOWN } });
+    expect(ok.statusCode).toBe(201);
+    const payout = ok.json();
+    expect(payout.reference).toBe("INV-2041");
+    expect(payout.grossAmount).toBe("100000000");
+    expect(payout.retentionAmount).toBe("10000000");
+    expect(payout.deductionsAmount).toBe("5000000");
+    const wrongNet = await h.app.inject({ method: "POST", url: "/v1/payouts", headers: auth, payload: { recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "84000000", ...BREAKDOWN } });
+    expect(wrongNet.statusCode).toBe(400);
+    expect(wrongNet.json().error).toContain("must equal the gross amount minus retention and deductions");
+    const noGross = await h.app.inject({ method: "POST", url: "/v1/payouts", headers: auth, payload: { recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "90000000", retentionAmount: "10000000" } });
+    expect(noGross.statusCode).toBe(400);
+    expect(noGross.json().error).toContain("gross amount is required");
+    const refOnly = await h.app.inject({ method: "POST", url: "/v1/payouts", headers: auth, payload: { recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "10000000", reference: "CERT-7" } });
+    expect(refOnly.statusCode).toBe(201);
+    expect(refOnly.json().reference).toBe("CERT-7");
+    expect(refOnly.json().grossAmount).toBeUndefined();
+  });
+
+  it("carries the fields through a batch and into the payout reconciliation export", async () => {
+    const h = makeHarness();
+    const { auth } = await makeMerchant(h);
+    const batch = await h.app.inject({ method: "POST", url: "/v1/payout-batches", headers: auth, payload: { rows: [{ recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "85000000", ...BREAKDOWN }] } });
+    expect(batch.statusCode).toBe(201);
+    const payout = batch.json().payouts[0];
+    expect(payout.reference).toBe("INV-2041");
+    const res = await h.app.inject({ method: "GET", url: "/v1/reconciliation/payouts.csv", headers: auth });
+    expect(res.statusCode).toBe(200);
+    const lines = res.body.trim().split("\n");
+    expect(lines[0]).toBe("payout_id,batch_id,recipient_address,reference,gross_amount,retention_amount,deductions_amount,net_amount,amount_received,destination_asset,status,deposit_address,created_at");
+    expect(lines[1]).toContain("INV-2041");
+    expect(lines[1]).toContain("100000000,10000000,5000000,85000000");
+    const badBatch = await h.app.inject({ method: "POST", url: "/v1/payout-batches", headers: auth, payload: { rows: [{ recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "80000000", ...BREAKDOWN }] } });
+    expect(badBatch.statusCode).toBe(400);
+  });
+
+  it("a retry of a failed payout keeps its reference and breakdown", async () => {
+    const h = makeHarness();
+    const { auth } = await makeMerchant(h);
+    const created = await h.app.inject({ method: "POST", url: "/v1/payouts", headers: auth, payload: { recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "85000000", ...BREAKDOWN } });
+    const payout = created.json();
+    h.store.updatePayout(payout.id, { status: "failed" });
+    const retry = await h.app.inject({ method: "POST", url: `/v1/payouts/${payout.id}/retry`, headers: auth });
+    expect(retry.statusCode).toBe(201);
+    expect(retry.json().reference).toBe("INV-2041");
+    expect(retry.json().grossAmount).toBe("100000000");
+    expect(retry.json().retentionAmount).toBe("10000000");
+  });
+});

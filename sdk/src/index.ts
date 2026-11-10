@@ -48,6 +48,9 @@ export interface Payout {
   id: string; merchantId: string; batchId?: string; recipientAddress: string;
   destinationAsset: string; originAsset: string; refundTo?: string; amount: string;
   status: string; depositAddress?: string; amountOut?: string; createdAt: string; updatedAt?: string;
+  retryOfId?: string;
+  reference?: string;
+  grossAmount?: string; retentionAmount?: string; deductionsAmount?: string;
 }
 
 export interface PayoutRow {
@@ -58,6 +61,10 @@ export interface PayoutRow {
   refundTo?: string;
   amount: string;
   reference?: string;
+  /** Optional certified breakdown: amount must equal grossAmount - retentionAmount - deductionsAmount. */
+  grossAmount?: string;
+  retentionAmount?: string;
+  deductionsAmount?: string;
 }
 
 export interface PayoutBatch {

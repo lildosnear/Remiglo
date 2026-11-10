@@ -270,15 +270,19 @@ export function renderPayouts(d: DashData, q: { notice?: string; error?: string 
   const form = `<form method="post" action="/dashboard/actions/payouts?merchant=${esc(merchant.id)}" class="inline-form">
     <div class="field"><label for="recipientAddress">Destination address</label><input id="recipientAddress" name="recipientAddress" required placeholder="contractor.near or 0x…"></div>
     <div class="field"><label for="destinationAsset">Destination asset</label><select id="destinationAsset" name="destinationAsset">${assetOptions()}</select></div>
-    <div class="field"><label for="amount">Amount</label><input id="amount" name="amount" required inputmode="decimal" placeholder="25.00"></div>
+    <div class="field"><label for="amount">Amount (net paid)</label><input id="amount" name="amount" required inputmode="decimal" placeholder="25.00"></div>
+    <div class="field"><label for="reference">Reference (optional)</label><input id="reference" name="reference" placeholder="INV-2041"></div>
+    <div class="field"><label for="grossAmount">Gross amount (optional)</label><input id="grossAmount" name="grossAmount" inputmode="decimal" placeholder="30.00"></div>
+    <div class="field"><label for="retentionAmount">Retention (optional)</label><input id="retentionAmount" name="retentionAmount" inputmode="decimal" placeholder="3.00"></div>
+    <div class="field"><label for="deductionsAmount">Deductions (optional)</label><input id="deductionsAmount" name="deductionsAmount" inputmode="decimal" placeholder="2.00"></div>
     <button class="btn" type="submit">Send payout</button></form>
-    <p class="note">Creates one payout through the same path as the API: quoted by NEAR Intents, created in the awaiting funding state. Pilot cap: ${esc(cap)} per payout.</p>`;
+    <p class="note">Creates one payout through the same path as the API: quoted by NEAR Intents, created in the awaiting funding state. Pilot cap: ${esc(cap)} per payout. When a gross amount is given, the net amount must equal gross minus retention minus deductions, and all four figures travel with the payment.</p>`;
   const csvForm = `<form method="post" action="/dashboard/actions/batches/csv?merchant=${esc(merchant.id)}">
     <div class="field" style="margin-bottom:10px"><label for="csvFile">Choose a CSV file</label><input id="csvFile" type="file" accept=".csv,text/csv" style="border:none;padding:0"></div>
     <div class="field" style="margin-bottom:10px"><label for="csv">CSV contents</label>
     <textarea id="csv" name="csv" rows="6" required style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;width:100%" placeholder="recipient_address,destination_asset,amount_units,reference"></textarea></div>
     <button class="btn" type="submit">Upload batch</button></form>
-    <p class="note">Header: <span class="mono">recipient_address,destination_asset,amount_units</span> or <span class="mono">recipient_id,amount_units</span>, with an optional trailing <span class="mono">reference</span> column. Amounts are smallest units. Up to 100 rows; every row is validated first and nothing is created if any row is invalid. Batches over the approval threshold wait for approval, exactly like API batches.</p>
+    <p class="note">Header: <span class="mono">recipient_address,destination_asset,amount_units</span> or <span class="mono">recipient_id,amount_units</span>, with optional trailing columns in this order: <span class="mono">reference</span>, <span class="mono">gross_amount_units</span>, <span class="mono">retention_amount_units</span>, <span class="mono">deductions_amount_units</span>. Amounts are smallest units. When a gross column is filled, the row amount must equal gross minus retention minus deductions. Up to 100 rows; every row is validated first and nothing is created if any row is invalid. Batches over the approval threshold wait for approval, exactly like API batches.</p>
     <script>document.getElementById("csvFile").addEventListener("change",function(){var f=this.files&&this.files[0];if(!f)return;var r=new FileReader();r.onload=function(){document.getElementById("csv").value=String(r.result||"");};r.readAsText(f);});</script>`;
   const canCreate = dashCan(d, "create");
   const content = `
@@ -288,7 +292,7 @@ export function renderPayouts(d: DashData, q: { notice?: string; error?: string 
     return [`<a href="/dashboard/payouts/batches/${esc(b.id)}?merchant=${esc(merchant.id)}"><span class="mono">${esc(b.id)}</span></a>`, chip(b.status), String(b.rowCount), esc(formatAmount(b.totalAmount, info(firstAsset))), fmtDate(b.createdAt)];
   })))}
   ${card("Payouts", htable(["Payout", "Recipient", "Amount", "Status", "Batch", "Created"], payouts.map((p) => [
-    `<span class="mono">${esc(short(p.id))}</span>`, `<span class="mono">${esc(short(p.recipientAddress, 30))}</span>`,
+    `<span class="mono">${esc(short(p.id))}</span>${p.reference ? `<br><span style="color:#5b6b82;font-size:12px">ref ${esc(p.reference)}</span>` : ""}`, `<span class="mono">${esc(short(p.recipientAddress, 30))}</span>`,
     esc(formatAmount(p.amount, info(p.originAsset))), chip(p.status),
     p.batchId ? `<a href="/dashboard/payouts/batches/${esc(p.batchId)}?merchant=${esc(merchant.id)}"><span class="mono">${esc(short(p.batchId))}</span></a>` : "—", fmtDate(p.createdAt),
   ])))}`;
@@ -339,10 +343,10 @@ export function renderBatchDetail(d: DashData, batch: PayoutBatch, q: { notice?:
     const r = byAddress.get(`${p.recipientAddress}|${p.destinationAsset}`);
     const ai = info(p.destinationAsset);
     return [
-      `<span class="mono">${esc(short(p.id))}</span>${p.retryOfId ? `<br><span style="color:#5b6b82;font-size:12px">retry of a failed row</span>` : ""}`,
+      `<span class="mono">${esc(short(p.id))}</span>${p.retryOfId ? `<br><span style="color:#5b6b82;font-size:12px">retry of a failed row</span>` : ""}${p.reference ? `<br><span style="color:#5b6b82;font-size:12px">ref ${esc(p.reference)}</span>` : ""}`,
       r ? `<strong>${esc(r.label)}</strong><br><span class="mono">${esc(short(p.recipientAddress, 30))}</span>` : `<span class="mono">${esc(short(p.recipientAddress, 30))}</span>`,
       esc(`${ai.symbol} on ${ai.chainName}`),
-      esc(formatAmount(p.amount, info(p.originAsset))),
+      `${esc(formatAmount(p.amount, info(p.originAsset)))}${p.grossAmount ? `<br><span style="color:#5b6b82;font-size:12px">gross ${esc(formatAmount(p.grossAmount, info(p.originAsset)))} · retention ${esc(formatAmount(p.retentionAmount ?? "0", info(p.originAsset)))} · deductions ${esc(formatAmount(p.deductionsAmount ?? "0", info(p.originAsset)))}</span>` : ""}`,
       p.amountOut ? esc(formatAmount(p.amountOut, ai)) : "—",
       chip(p.status),
       p.depositAddress ? `<span class="mono">${esc(short(p.depositAddress, 24))}</span>` : "—",
@@ -593,7 +597,9 @@ export function renderReconciliation(d: DashData): string {
   ${card("Exceptions", `<p class="note">Finished payments that did not settle cleanly. In flight payments are on the Payments page, not here.</p>` +
     htable(["Type", "ID", "Status", "Reason", "Amount", "Updated"], exceptions))}
   ${card("Export", `<p>Full per invoice reconciliation with gross, fee estimate and net is available from the API export endpoint. It needs your merchant API key, so call it from your backend or with curl:</p>
-    <p><a href="/v1/reconciliation/export.csv">GET /v1/reconciliation/export.csv</a></p>`)}`;
+    <p><a href="/v1/reconciliation/export.csv">GET /v1/reconciliation/export.csv</a></p>
+    <p>Per payout reconciliation carries each payment reference with its gross, retention, deductions and net, ready to match against approved invoices at month end:</p>
+    <p><a href="/v1/reconciliation/payouts.csv">GET /v1/reconciliation/payouts.csv</a></p>`)}`;
   return page(d, {
     active: "reconciliation", title: "Reconciliation", subtitle: `${merchant.name} · matched, unmatched and failed transactions`,
     merchantName: merchant.name, content,
@@ -687,6 +693,7 @@ const API_SURFACE: Array<[string, string, string]> = [
   ["GET", "/v1/ledger", "Ledger entries, optionally by entity"],
   ["GET", "/v1/reconciliation/daily", "Daily reconciliation summary"],
   ["GET", "/v1/reconciliation/export.csv", "Reconciliation CSV export"],
+  ["GET", "/v1/reconciliation/payouts.csv", "Payout reconciliation CSV export (reference, gross, retention, deductions, net)"],
   ["POST", "/v1/webhook-endpoints", "Register a webhook endpoint"],
   ["GET", "/v1/webhook-endpoints", "List webhook endpoints"],
   ["GET", "/v1/webhook-deliveries", "List webhook deliveries"],

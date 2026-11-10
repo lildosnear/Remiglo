@@ -41,11 +41,14 @@ export interface BatchCsvResult {
 
 const HEADER_ADDRESS = ["recipient_address", "destination_asset", "amount_units"];
 const HEADER_RECIPIENT = ["recipient_id", "amount_units"];
+const OPTIONAL_SUFFIX = ["reference", "gross_amount_units", "retention_amount_units", "deductions_amount_units"];
 
 /**
  * Parse a payout batch CSV. Accepted headers:
- *   recipient_address,destination_asset,amount_units[,reference]
- *   recipient_id,amount_units[,reference]
+ *   recipient_address,destination_asset,amount_units[,reference[,gross_amount_units[,retention_amount_units[,deductions_amount_units]]]]
+ *   recipient_id,amount_units[,reference[,gross_amount_units[,retention_amount_units[,deductions_amount_units]]]]
+ * The optional columns, when present, appear in that order. An empty
+ * optional cell means the row does not carry that value.
  * Every data row is validated; if any row is invalid, rows is undefined
  * and errors carries one entry per problem with its 1 based line number
  * (the header is line 1). Nothing is created from a partially valid file.
@@ -55,18 +58,23 @@ export function parseBatchCsv(text: string): BatchCsvResult {
   const table = parseCsv(text);
   if (table.length === 0) return { errors: [{ line: 1, message: "the file is empty" }] };
   const header = table[0].map((h) => h.trim().toLowerCase());
-  const hasRef = header[header.length - 1] === "reference";
-  const core = hasRef ? header.slice(0, -1) : header;
-  const isAddress = JSON.stringify(core) === JSON.stringify(HEADER_ADDRESS);
-  const isRecipient = JSON.stringify(core) === JSON.stringify(HEADER_RECIPIENT);
-  if (!isAddress && !isRecipient) {
+  const isAddress = JSON.stringify(header.slice(0, 3)) === JSON.stringify(HEADER_ADDRESS);
+  const isRecipient = !isAddress && JSON.stringify(header.slice(0, 2)) === JSON.stringify(HEADER_RECIPIENT);
+  const coreLen = isAddress ? 3 : isRecipient ? 2 : 0;
+  const suffix = coreLen ? header.slice(coreLen) : [];
+  const suffixOk = suffix.length <= OPTIONAL_SUFFIX.length && suffix.every((h, i) => h === OPTIONAL_SUFFIX[i]);
+  if (!coreLen || !suffixOk) {
     return {
       errors: [{
         line: 1,
-        message: `header must be "${HEADER_ADDRESS.join(",")}" or "${HEADER_RECIPIENT.join(",")}" (optionally followed by ",reference")`,
+        message: `header must be "${HEADER_ADDRESS.join(",")}" or "${HEADER_RECIPIENT.join(",")}" (optionally followed by ",reference,gross_amount_units,retention_amount_units,deductions_amount_units" in that order)`,
       }],
     };
   }
+  const colOf = (name: string) => {
+    const i = suffix.indexOf(name);
+    return i === -1 ? -1 : coreLen + i;
+  };
   const width = header.length;
   const dataRows = table.slice(1);
   if (dataRows.length === 0) return { errors: [{ line: 1, message: "the file has a header but no payout rows" }] };
@@ -87,14 +95,28 @@ export function parseBatchCsv(text: string): BatchCsvResult {
       errors.push({ line, message: "amount_units must be a positive integer in smallest units" });
       return;
     }
-    const reference = hasRef ? vals[width - 1] : "";
+    const reference = colOf("reference") >= 0 ? vals[colOf("reference")] : "";
+    const extra: Record<string, string> = {};
+    let badUnits = false;
+    for (const [col, key] of [["gross_amount_units", "grossAmount"], ["retention_amount_units", "retentionAmount"], ["deductions_amount_units", "deductionsAmount"]] as const) {
+      const idx = colOf(col);
+      if (idx < 0) continue;
+      const v = vals[idx];
+      if (v === "") continue;
+      if (!/^[0-9]+$/.test(v)) { badUnits = true; break; }
+      extra[key] = v;
+    }
+    if (badUnits) {
+      errors.push({ line, message: "gross_amount_units, retention_amount_units and deductions_amount_units must be integers in smallest units" });
+      return;
+    }
     if (isAddress) {
       if (!vals[0]) { errors.push({ line, message: "recipient_address is empty" }); return; }
       if (!vals[1]) { errors.push({ line, message: "destination_asset is empty" }); return; }
-      rows.push({ recipientAddress: vals[0], destinationAsset: vals[1], amount, ...(reference ? { reference } : {}) });
+      rows.push({ recipientAddress: vals[0], destinationAsset: vals[1], amount, ...(reference ? { reference } : {}), ...extra });
     } else {
       if (!vals[0]) { errors.push({ line, message: "recipient_id is empty" }); return; }
-      rows.push({ recipientId: vals[0], amount, ...(reference ? { reference } : {}) });
+      rows.push({ recipientId: vals[0], amount, ...(reference ? { reference } : {}), ...extra });
     }
   });
   if (errors.length > 0) return { errors };

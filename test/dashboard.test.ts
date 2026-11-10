@@ -503,3 +503,34 @@ describe("batch row retry", () => {
     expect(h.store.getBatchById(s.batchId)?.status).toBe("completed");
   });
 });
+
+describe("payout references on the dashboard", () => {
+  it("the batch page shows the reference and the breakdown under the net amount", async () => {
+    const h = makeHarness();
+    const s = seedKnown(h);
+    seedPayout(h.store, s.merchantId, { batchId: s.batchId, recipientAddress: "ama.near", amount: "85000000", status: "settled", amountOut: "85000000", reference: "INV-2041", grossAmount: "100000000", retentionAmount: "10000000", deductionsAmount: "5000000" });
+    const { cookie } = await dashAuth(h);
+    const res = await h.app.inject({ method: "GET", url: `/dashboard/payouts/batches/${s.batchId}`, headers: { cookie } });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("ref INV-2041");
+    expect(res.body).toContain("gross 100.00 USDC · retention 10.00 USDC · deductions 5.00 USDC");
+  });
+
+  it("the Send payout form carries reference and breakdown into the payout, in units", async () => {
+    const h = makeHarness();
+    const s = seedKnown(h);
+    const { cookie } = await dashAuth(h);
+    const res = await h.app.inject({ method: "POST", url: "/dashboard/actions/payouts", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, payload: new URLSearchParams({ recipientAddress: "ama.near", destinationAsset: USDC_NEAR, amount: "85", reference: "INV-2041", grossAmount: "100", retentionAmount: "10", deductionsAmount: "5" }).toString() });
+    expect(res.statusCode).toBe(303);
+    const payouts = h.store.listPayouts(s.merchantId);
+    const created = payouts[payouts.length - 1];
+    expect(created.reference).toBe("INV-2041");
+    expect(created.grossAmount).toBe("100000000");
+    expect(created.retentionAmount).toBe("10000000");
+    expect(created.deductionsAmount).toBe("5000000");
+    expect(created.amount).toBe("85000000");
+    const bad = await h.app.inject({ method: "POST", url: "/dashboard/actions/payouts", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, payload: new URLSearchParams({ recipientAddress: "ama.near", destinationAsset: USDC_NEAR, amount: "84", grossAmount: "100", retentionAmount: "10", deductionsAmount: "5" }).toString() });
+    expect(bad.statusCode).toBe(303);
+    expect(decodeURIComponent(bad.headers.location ?? "")).toContain("must equal the gross amount minus retention and deductions");
+  });
+});
