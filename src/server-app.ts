@@ -902,15 +902,19 @@ export function buildApp(options: BuildOptions = {}) {
   // ---- payouts ----
   const createPayoutFor = async (m: Merchant, row: any, batchId?: string, idem?: string, retryOf?: string) => {
     const amount = String(row.amount);
+    // The merchant funds a payout from the asset they settle in, unless the
+    // row names its own origin. Defaulting to the destination asset made
+    // same asset payouts unquotable on backends that refuse them.
+    const originAsset = row.originAsset ?? m.settlementAsset;
     const q = await intents.quote({
-      dry: false, originAsset: row.originAsset ?? row.destinationAsset, destinationAsset: row.destinationAsset,
+      dry: false, originAsset, destinationAsset: row.destinationAsset,
       amount, recipient: row.recipientAddress, refundTo: row.refundTo ?? m.refundTo,
       appFeeBps: cfg.appFeeBps, appFeeRecipient: cfg.appFeeRecipient,
     });
     const hasGross = row.grossAmount !== undefined && row.grossAmount !== null && row.grossAmount !== "";
     const payout = store.createPayout({
       id: makeId("pay"), merchantId: m.id, batchId, recipientAddress: row.recipientAddress,
-      destinationAsset: row.destinationAsset, originAsset: row.originAsset ?? row.destinationAsset,
+      destinationAsset: row.destinationAsset, originAsset,
       refundTo: row.refundTo ?? m.refundTo, amount, status: "awaiting_funding",
       depositAddress: q.quote.depositAddress, amountOut: q.quote.amountOut,
       idempotencyKey: batchId ? undefined : idem, retryOfId: retryOf, createdAt: new Date().toISOString(),
@@ -1039,8 +1043,10 @@ export function buildApp(options: BuildOptions = {}) {
    * The one batch creation path. Rows must already be resolved and
    * validated. Over threshold batches wait in pending_approval with no
    * payouts created; under threshold batches quote every row at once.
-   * A quote failure is reported, with the batch left in place, exactly
-   * as the API has always behaved.
+   * A quote failure fails the whole batch: the batch is marked failed,
+   * and any rows already quoted are marked failed with it. Their deposit
+   * addresses were never returned in a success response, so nothing can
+   * be funded against them.
    */
   const createBatchFor = async (m: Merchant, rows: any[]) => {
     const total = rows.reduce((acc: bigint, r: any) => acc + BigInt(String(r.amount)), 0n);
@@ -1054,13 +1060,17 @@ export function buildApp(options: BuildOptions = {}) {
     // Anchor once the batch is live: immediately when it starts
     // active, otherwise at approval time (see approveBatchFor).
     if (!needsApproval) anchorBatchNow(batch, rows as PayoutRow[]);
-    const payouts: unknown[] = [];
+    const payouts: Payout[] = [];
     let quoteError: string | undefined;
     if (!needsApproval) {
       try {
         for (const row of rows) payouts.push(await createPayoutFor(m, row, batch.id));
       } catch (err) {
         quoteError = err instanceof Error ? err.message : String(err);
+        for (const p of payouts) store.updatePayout(p.id, { status: "failed" });
+        store.updateBatch(batch.id, { status: "failed" });
+        store.addLedger({ merchantId: m.id, entityType: "batch", entityId: batch.id, kind: "batch_failed", amount: total.toString(), asset: String(rows[0].destinationAsset ?? "") });
+        return { batch: store.getBatch(m.id, batch.id) ?? batch, payouts, quoteError };
       }
     }
     return { batch, payouts, quoteError };
@@ -1110,8 +1120,17 @@ export function buildApp(options: BuildOptions = {}) {
 
   /** The one batch approval path: quote every row, mark active, ledger. API and dashboard both call this. */
   const approveBatchFor = async (m: Merchant, batch: PayoutBatch) => {
-    const payouts = [];
-    for (const row of batch.rows) payouts.push(await createPayoutFor(m, row, batch.id));
+    const payouts: Payout[] = [];
+    try {
+      for (const row of batch.rows) payouts.push(await createPayoutFor(m, row, batch.id));
+    } catch (err) {
+      // Approval stays retryable: fail only the rows this attempt quoted
+      // (their deposit addresses were never returned), keep the batch in
+      // pending_approval, and let the caller report the quote failure. A
+      // later approval creates fresh payouts, so no row can be paid twice.
+      for (const p of payouts) store.updatePayout(p.id, { status: "failed" });
+      throw err;
+    }
     const updated = store.updateBatch(batch.id, { status: "active" })!;
     store.addLedger({ merchantId: m.id, entityType: "batch", entityId: batch.id, kind: "batch_approved", amount: batch.totalAmount, asset: String((batch.rows[0] as any)?.destinationAsset ?? "") });
     // First anchor for a batch that waited for approval.

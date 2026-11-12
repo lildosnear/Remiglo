@@ -146,7 +146,7 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncResult> {
   for (const batchId of touchedBatches) {
     try {
       const batch = store.getBatchById(batchId);
-      if (!batch || batch.status === "completed") continue;
+      if (!batch || batch.status !== "active") continue;
       const rows = store.payoutsByBatch(batchId);
       if (rows.length > 0 && rows.every((r) => PAYOUT_TERMINAL.includes(r.status))) {
         store.updateBatch(batchId, { status: "completed" });

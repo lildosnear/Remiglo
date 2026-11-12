@@ -102,6 +102,10 @@ export class MockIntents implements IntentsClient {
   private counter = 0;
   private quotes = new Map<string, { amountOut: string; steps: number }>();
   private forced = new Map<string, OneClickStatus>();
+  private quotesBeforeFailure: number | null = null;
+
+  /** Make quote() throw once, after n more successful quotes. Mirrors failNextStatus, for quotes. */
+  failQuotesAfter(n: number) { this.quotesBeforeFailure = n; }
 
   async tokens(): Promise<OneClickToken[]> {
     return [
@@ -112,6 +116,13 @@ export class MockIntents implements IntentsClient {
   }
 
   async quote(body: QuoteRequest & { dry: boolean }): Promise<{ quote: QuoteResult }> {
+    if (this.quotesBeforeFailure !== null) {
+      if (this.quotesBeforeFailure <= 0) {
+        this.quotesBeforeFailure = null;
+        throw new Error("mock quote failure");
+      }
+      this.quotesBeforeFailure -= 1;
+    }
     this.counter += 1;
     const depositAddress = `mock_deposit_${this.counter}`;
     const amountOut = body.amount; // same asset value in mock mode

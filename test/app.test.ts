@@ -306,6 +306,59 @@ describe("payouts and batches", () => {
     expect(deliveries.map((d: any) => d.event)).toContain("batch.completed");
     expect(deliveries.map((d: any) => d.event)).toContain("payout.settled");
   });
+
+  it("defaults a payout origin to the merchant settlement asset, and honours an explicit origin", async () => {
+    const h = makeHarness();
+    const { auth } = await makeMerchant(h);
+    const USDT_NEAR = "nep141:usdt.tether-token.near";
+    const res = await h.app.inject({ method: "POST", url: "/v1/payouts", headers: auth, payload: { recipientAddress: "payee.near", destinationAsset: USDT_NEAR, amount: "10000000" } });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().originAsset).toBe(USDC_NEAR);
+    expect(res.json().destinationAsset).toBe(USDT_NEAR);
+    const explicit = await h.app.inject({ method: "POST", url: "/v1/payouts", headers: auth, payload: { recipientAddress: "payee.near", originAsset: USDT_NEAR, destinationAsset: USDC_NEAR, amount: "10000000" } });
+    expect(explicit.statusCode).toBe(201);
+    expect(explicit.json().originAsset).toBe(USDT_NEAR);
+  });
+
+  it("fails the whole batch when a quote fails during creation", async () => {
+    const h = makeHarness();
+    const { auth } = await makeMerchant(h);
+    h.mock.failQuotesAfter(1);
+    const res = await h.app.inject({ method: "POST", url: "/v1/payout-batches", headers: auth, payload: { rows: [row("10000000"), row("20000000")] } });
+    expect(res.statusCode).toBe(502);
+    const batchId = res.json().batch.id;
+    expect(res.json().batch.status).toBe("failed");
+    const batch = await h.app.inject({ method: "GET", url: `/v1/payout-batches/${batchId}`, headers: auth });
+    expect(batch.json().status).toBe("failed");
+    expect(batch.json().payouts).toHaveLength(1);
+    expect(batch.json().payouts[0].status).toBe("failed");
+    const ledger = (await h.app.inject({ method: "GET", url: `/v1/ledger?entity_id=${batchId}`, headers: auth })).json();
+    expect(ledger.map((e: any) => e.kind)).toContain("batch_failed");
+    await sync(h);
+    const after = await h.app.inject({ method: "GET", url: `/v1/payout-batches/${batchId}`, headers: auth });
+    expect(after.json().status).toBe("failed");
+  });
+
+  it("keeps an over threshold batch pending when approval quoting fails, and approval can be retried", async () => {
+    const h = makeHarness({ approvalThresholdUnits: "300000000", pilotMaxPayoutUnits: "200000000" });
+    const { auth } = await makeMerchant(h);
+    const res = await h.app.inject({ method: "POST", url: "/v1/payout-batches", headers: auth, payload: { rows: [row("200000000"), row("200000000")] } });
+    const batchId = res.json().id;
+    h.mock.failQuotesAfter(1);
+    const failed = await h.app.inject({ method: "POST", url: `/v1/payout-batches/${batchId}/approve`, headers: auth });
+    expect(failed.statusCode).toBe(502);
+    const pending = await h.app.inject({ method: "GET", url: `/v1/payout-batches/${batchId}`, headers: auth });
+    expect(pending.json().status).toBe("pending_approval");
+    expect(pending.json().payouts).toHaveLength(1);
+    expect(pending.json().payouts[0].status).toBe("failed");
+    const approved = await h.app.inject({ method: "POST", url: `/v1/payout-batches/${batchId}/approve`, headers: auth });
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json().status).toBe("active");
+    const all = (await h.app.inject({ method: "GET", url: `/v1/payout-batches/${batchId}`, headers: auth })).json().payouts;
+    expect(all).toHaveLength(3);
+    expect(all.filter((p: any) => p.status === "awaiting_funding")).toHaveLength(2);
+    expect(all.filter((p: any) => p.status === "failed")).toHaveLength(1);
+  });
 });
 
 describe("reconciliation and dashboard", () => {
