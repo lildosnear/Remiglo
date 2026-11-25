@@ -128,7 +128,7 @@ See [sdk/README.md](sdk/README.md) for the full method list.
 
 ## 9. Run the tests
 
-The whole suite runs offline in mock mode (90+ tests), plus the Rust contract tests.
+The whole suite runs offline in mock mode (115 tests), plus the Rust contract tests.
 
 ```bash
 npm run typecheck
@@ -155,6 +155,16 @@ Safety rails in live mode: `PILOT_MAX_PAYOUT_UNITS` caps every payout (default 1
 - Deploy transaction: [EtFtcY6KDVNJXpTiqo96h1P6nDBMRc3UETCguR6dKobB](https://testnet.nearblocks.io/txns/EtFtcY6KDVNJXpTiqo96h1P6nDBMRc3UETCguR6dKobB)
 - Demo merchant registration (remiglo.testnet as its own first merchant): [AdUkb1ecJTbJxzrhaGsvve82maAxgWNoFefBZn3s87oY](https://testnet.nearblocks.io/txns/AdUkb1ecJTbJxzrhaGsvve82maAxgWNoFefBZn3s87oY)
 - Demo batch record (`batch_demo_001`, 6 rows, 540 USDC): [AwffpTYN8yg1WntoF5nkJzkaC4BYkQb82grRd649bHN4](https://testnet.nearblocks.io/txns/AwffpTYN8yg1WntoF5nkJzkaC4BYkQb82grRd649bHN4)
+
+## Live settlement on testnet (12 November 2026)
+
+On 12 November 2026 the full money flow ran on testnet against the real Intents verifier, through Tidepool, a community built testnet copy of the 1Click API. Tidepool is not official and it runs on test tokens only, but the verifier underneath it is real Intents code. The run used a throwaway instance with no partner key and a fresh database.
+
+- An invoice for 2 USDC settled as exactly 1.995824 USDT, with the balance verified on chain and reconciliation matched.
+- A two row batch of 1.0 and 1.4 USDC settled in full as 0.997887 and 1.397042 USDT, and the batch completed.
+- Five signed webhooks were delivered, and the batch was anchored into the registry at remiglo.testnet: [9wfUv8KtcnC43MiwMZj8PU1umLZ7Rh8aWhTBAzicGsZo](https://testnet.nearblocks.io/txns/9wfUv8KtcnC43MiwMZj8PU1umLZ7Rh8aWhTBAzicGsZo)
+
+What this run did not cover: a real refund, a real quote expiry, a true external chain leg, and mainnet solver behaviour. A tiny mainnet run is still owed before real customers, and it waits on the 1Click quote endpoint coming back.
 
 Build and redeploy:
 
