@@ -5,7 +5,7 @@
  * same trust model as the v1 read only page. It never renders API
  * keys, key hashes, or webhook secrets.
  */
-import { feeEstimate, INVOICE_TERMINAL, PAYOUT_TERMINAL, type DashRole, type Invoice, type Merchant, type Payout, type PayoutBatch } from "./core.js";
+import { feeEstimate, INVOICE_TERMINAL, PAYOUT_TERMINAL, type DashRole, type Invoice, type Merchant, type Payout, type PayoutBatch, type Recipient } from "./core.js";
 import type { Store } from "./store.js";
 import { builtinAsset, formatAmount, formatUnits, guessAsset, BUILTIN_ASSETS, type AssetInfo } from "./assets.js";
 import { barChartSvg, card, chip, donutSvg, esc, hBarSvg, htable, shell, statCard, type ShellOptions } from "./dashui.js";
@@ -394,31 +394,57 @@ export function renderRecipients(d: DashData, q: { notice?: string; error?: stri
   const book = store.listRecipients(merchant.id);
   const bookKeys = new Set(book.map((r) => `${r.address}|${r.assetId}`));
   const canCreate = dashCan(d, "create");
-  const bookRows = book.map((r) => {
+  const kindLabel = (k: string) => (k === "bank" ? "Bank account" : k === "momo" ? "Mobile money" : "Wallet");
+  const kindOptions = (current: string) => ["wallet", "bank", "momo"]
+    .map((k) => `<option value="${k}"${k === current ? " selected" : ""}>${kindLabel(k)}</option>`).join("");
+  // The fields for every kind, pre filled. The server validates only
+  // the chosen kind's fields; the rest are ignored on save.
+  const kindFields = (r?: Recipient) => `
+      <div class="field"><label>Kind</label><select name="kind">${kindOptions(r?.kind ?? "wallet")}</select></div>
+      <div class="field"><label>Wallet address</label><input name="address" value="${esc(r?.address ?? "")}" style="min-width:150px"></div>
+      <div class="field"><label>Asset and network</label><select name="assetId">${assetOptions(r?.assetId)}</select></div>
+      <div class="field"><label>Wallet network (wallet kind)</label><input name="network" value="${esc(r?.network ?? "")}" placeholder="ETH_MAINNET, BASE_MAINNET, MATIC_MAINNET or SOLANA_MAINNET" style="min-width:170px"></div>
+      <div class="field"><label>Bank name (bank kind)</label><input name="bankName" value="${esc(r?.bankName ?? "")}" style="min-width:130px"></div>
+      <div class="field"><label>Account number (bank kind)</label><input name="accountNumber" value="${esc(r?.accountNumber ?? "")}" style="min-width:130px"></div>
+      <div class="field"><label>Account name (bank kind)</label><input name="accountName" value="${esc(r?.accountName ?? "")}" style="min-width:130px"></div>
+      <div class="field"><label>Mobile money provider (momo kind)</label><input name="momoProvider" value="${esc(r?.momoProvider ?? "")}" placeholder="MTN, M-Pesa…" style="min-width:130px"></div>
+      <div class="field"><label>Phone number (momo kind)</label><input name="phoneNumber" value="${esc(r?.phoneNumber ?? "")}" style="min-width:130px"></div>
+      <div class="field"><label>Country (bank and momo)</label><input name="country" value="${esc(r?.country ?? "")}" placeholder="NG" style="min-width:80px"></div>
+      <div class="field"><label>Currency (bank and momo)</label><input name="currency" value="${esc(r?.currency ?? "")}" placeholder="NGN" style="min-width:80px"></div>`;
+  const detailsCell = (r: Recipient): string => {
+    if (r.kind === "bank") {
+      return `${esc(r.bankName ?? "—")}<br><span class="mono">${esc(r.accountNumber ?? "")}</span><br>${esc(r.accountName ?? "")} · ${esc(r.country ?? "")} ${esc(r.currency ?? "")}`;
+    }
+    if (r.kind === "momo") {
+      return `${esc(r.momoProvider ?? "—")}<br><span class="mono">${esc(r.phoneNumber ?? "")}</span><br>${esc(r.country ?? "")} ${esc(r.currency ?? "")}`;
+    }
     const ai = info(r.assetId);
+    return `<span class="mono">${esc(short(r.address, 34))}</span><br>${esc(`${ai.symbol} on ${ai.chainName}`)}${r.network ? `<br>Network ${esc(r.network)}` : ""}`;
+  };
+  const bookRows = book.map((r) => {
     const h = history.get(`${r.address}|${r.assetId}`);
     const editForm = canCreate ? `<form method="post" action="/dashboard/actions/recipients/${esc(r.id)}/update?merchant=${esc(merchant.id)}" class="inline-form" style="gap:6px">
       <div class="field"><label>Label</label><input name="label" value="${esc(r.label)}" style="min-width:120px"></div>
+      ${kindFields(r)}
       <div class="field"><label>Notes</label><input name="notes" value="${esc(r.notes ?? "")}" style="min-width:140px"></div>
       <button class="btn secondary small" type="submit">Save</button></form>` : "";
     const delForm = canCreate ? `<form method="post" action="/dashboard/actions/recipients/${esc(r.id)}/delete?merchant=${esc(merchant.id)}" style="margin:0"><button class="btn secondary small" type="submit">Delete</button></form>` : "—";
     return [
       `<strong>${esc(r.label || "—")}</strong><br>${editForm}`,
-      `<span class="mono">${esc(short(r.address, 34))}</span>`,
-      esc(`${ai.symbol} on ${ai.chainName}`),
+      esc(kindLabel(r.kind)),
+      detailsCell(r),
       h ? String(h.count) : "0",
-      h ? esc(formatUnits(h.total.toString(), ai.decimals)) : "—",
+      h && r.assetId ? esc(formatUnits(h.total.toString(), info(r.assetId).decimals)) : "—",
       esc(r.notes ?? "—"),
       delForm,
     ];
   });
   const addForm = `<form method="post" action="/dashboard/actions/recipients?merchant=${esc(merchant.id)}" class="inline-form">
     <div class="field"><label for="label">Label</label><input id="label" name="label" required placeholder="Contractor name"></div>
-    <div class="field"><label for="address">Wallet address</label><input id="address" name="address" required placeholder="contractor.near or 0x…"></div>
-    <div class="field"><label for="assetId">Asset and network</label><select id="assetId" name="assetId">${assetOptions()}</select></div>
+    ${kindFields()}
     <div class="field"><label for="notes">Notes (optional)</label><input id="notes" name="notes" placeholder="Role, project…"></div>
     <button class="btn" type="submit">Add recipient</button></form>
-    <p class="note">Saved recipients can be referenced by id from the API when creating payouts and batches, so wallet addresses live in one place.</p>`;
+    <p class="note">Pick the kind, then fill in that kind's fields; the others are ignored. Bank recipients need the bank name, account number, account name, country and currency. Mobile money needs the provider, phone number, country and currency. Wallet recipients take an address and asset, and the network, when given, must be one of the four Nuvion networks: ETH_MAINNET, BASE_MAINNET, MATIC_MAINNET or SOLANA_MAINNET. Saved recipients can be referenced by id from the API when creating payouts and batches, so payment details live in one place.</p>`;
   const histRows = [...history.entries()]
     .filter(([key]) => !bookKeys.has(key))
     .sort((a, b) => b[1].last.localeCompare(a[1].last))
@@ -431,13 +457,13 @@ export function renderRecipients(d: DashData, q: { notice?: string; error?: stri
       ];
     });
   const content = `
-  ${card("Address book", htable(["Recipient", "Address", "Asset and network", "Payments", "Total sent", "Notes", ""], bookRows))}
+  ${card("Address book", htable(["Recipient", "Kind", "Details", "Payments", "Total sent", "Notes", ""], bookRows))}
   ${canCreate ? card("Add recipient", addForm) : card("Add recipient", READ_ONLY_NOTE)}
   ${card("Recipients from payment history",
     `<p class="note">Collected from payment history: addresses this business has paid that are not in the address book yet.</p>` +
     htable(["Address", "Asset and network", "Payments", "Total sent", "Last used"], histRows))}`;
   return page(d, {
-    active: "recipients", title: "Recipients", subtitle: `${merchant.name} · saved contractor wallets and networks`,
+    active: "recipients", title: "Recipients", subtitle: `${merchant.name} · saved recipients: wallets, bank accounts and mobile money`,
     merchantName: merchant.name, content, ...banners(q),
   });
 }

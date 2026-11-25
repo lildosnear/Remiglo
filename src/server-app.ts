@@ -19,11 +19,11 @@ import { BUILTIN_ASSETS, builtinAsset, chainNameFor, guessAsset, parseDecimalToU
 import { renderPayNotFound, renderPayPage } from "./lib/paypage.js";
 import { parseBatchCsv } from "./lib/csv.js";
 import { getIntentsClient, MockIntents, type IntentsClient } from "./services/intents.js";
-import { getNuvionClient, MockNuvion, type NuvionClient } from "./services/nuvion.js";
+import { getNuvionClient, MockNuvion, type CreatePaymentDetailRequest, type NuvionClient } from "./services/nuvion.js";
 import { NearRegistry, type RegistryClient } from "./services/registry.js";
 import { indexOnce, indexerStatus } from "./services/indexer.js";
 import { NearRpc } from "./services/nearTx.js";
-import type { Payout, PayoutRow } from "./lib/core.js";
+import type { Payout, PayoutRow, Recipient, RecipientKind } from "./lib/core.js";
 import { syncOnce } from "./services/poller.js";
 import { firstRunAt, type ScheduleServices } from "./services/schedules.js";
 import {
@@ -312,6 +312,8 @@ export function buildApp(options: BuildOptions = {}) {
       .map(([k, v]) => `${k}=${encodeURIComponent(v!)}`).join("&");
     return reply.redirect(303, qs ? `${path}?${qs}` : path);
   };
+  /** API validation messages are lowercase fragments; dashboard banners read as sentences. */
+  const dashError = (msg: string) => msg.charAt(0).toUpperCase() + msg.slice(1) + (msg.endsWith(".") ? "" : ".");
   const guardDashAction = (req: FastifyRequest, reply: FastifyReply, action: DashAction = "create"): boolean => {
     if (!usersExist()) {
       // Break glass: only while no owner account exists yet.
@@ -670,13 +672,15 @@ export function buildApp(options: BuildOptions = {}) {
     const back = (params: Record<string, string | undefined>) =>
       dashRedirect(reply, "/dashboard/recipients", { merchant: m.id, ...params });
     const b = (req.body ?? {}) as any;
-    if (!b.label || !b.address || !b.assetId) return back({ error: "Label, address and asset are required." });
-    if (!(await knownAsset(String(b.assetId)))) return back({ error: "That asset is not a known asset." });
-    store.createRecipient({
-      merchantId: m.id, label: String(b.label), address: String(b.address),
-      assetId: String(b.assetId), chain: chainOf(String(b.assetId)),
+    if (!b.label) return back({ error: "Label is required." });
+    const parsed = await parseRecipientFields(b, false);
+    if ("error" in parsed) return back({ error: dashError(parsed.error) });
+    let rec = store.createRecipient({
+      merchantId: m.id, label: String(b.label),
       notes: b.notes ? String(b.notes) : undefined,
+      ...parsed.fields,
     });
+    rec = await linkRecipientToNuvion(m, rec);
     return back({ notice: "Recipient saved to the address book." });
   });
 
@@ -689,10 +693,13 @@ export function buildApp(options: BuildOptions = {}) {
     const existing = store.getRecipient(m.id, (req.params as any).id);
     if (!existing) return back({ error: "Recipient not found." });
     const b = (req.body ?? {}) as any;
-    store.updateRecipient(m.id, existing.id, {
-      label: b.label !== undefined ? String(b.label) : existing.label,
-      notes: b.notes !== undefined ? String(b.notes) : existing.notes,
-    });
+    const parsed = await parseRecipientFields(b, true, existing);
+    if ("error" in parsed) return back({ error: dashError(parsed.error) });
+    const patch: Record<string, unknown> = { ...parsed.fields };
+    if (b.label !== undefined) patch.label = String(b.label);
+    if (b.notes !== undefined) patch.notes = b.notes ? String(b.notes) : undefined;
+    let rec = store.updateRecipient(m.id, existing.id, patch as any)!;
+    if (recipientLinkNeeded(existing, rec, b)) rec = await linkRecipientToNuvion(m, rec);
     return back({ notice: "Recipient updated." });
   });
 
@@ -927,27 +934,194 @@ export function buildApp(options: BuildOptions = {}) {
   };
   const chainOf = (assetId: string) => (builtinAsset(assetId) ?? guessAsset(assetId)).blockchain;
 
-  const validRecipientFields = async (b: any, partial: boolean): Promise<string | undefined> => {
-    if (!partial || b.address !== undefined) {
-      if (!b?.address || typeof b.address !== "string") return "address is required";
+  // Recipient kinds (fiat slice 3): bank accounts and mobile money
+  // wallets join the original stablecoin wallet shape. A wallet network,
+  // when recorded, must be one Nuvion can pay on; anything else is
+  // refused here, at creation, not later at payout time.
+  const RECIPIENT_KINDS: RecipientKind[] = ["bank", "momo", "wallet"];
+  const NUVION_NETWORKS = ["ETH_MAINNET", "BASE_MAINNET", "MATIC_MAINNET", "SOLANA_MAINNET"];
+  /** Body keys that decide how a recipient gets paid (provider aliases momoProvider). */
+  const RECIPIENT_PAYMENT_KEYS = ["kind", "address", "assetId", "bankName", "accountNumber", "accountName",
+    "country", "currency", "momoProvider", "provider", "phoneNumber", "network"];
+  /** Recipient fields that decide how they get paid; changing any re links the Nuvion counterparty. */
+  const RECIPIENT_PAYMENT_FIELDS = ["kind", "address", "assetId", "bankName", "accountNumber", "accountName",
+    "country", "currency", "momoProvider", "phoneNumber", "network"] as const;
+
+  interface RecipientFieldSet {
+    kind: RecipientKind;
+    address: string;
+    assetId: string;
+    chain: string;
+    bankName?: string;
+    accountNumber?: string;
+    accountName?: string;
+    country?: string;
+    currency?: string;
+    momoProvider?: string;
+    phoneNumber?: string;
+    network?: string;
+  }
+
+  /**
+   * Validate a recipient body and normalise it into store ready fields.
+   * With partial set, the body is merged over the existing recipient
+   * first, so a kind switch is checked against the full result. The
+   * wallet shape (address plus a known asset) is the original creation
+   * shape and keeps its original rules. Bank and mobile money carry
+   * their rail fields instead; the account number or phone number also
+   * fills the address column, since that is where the money goes and
+   * the column payout resolution reads.
+   */
+  const parseRecipientFields = async (
+    b: any, partial: boolean, existing?: Recipient,
+  ): Promise<{ fields: RecipientFieldSet } | { error: string }> => {
+    const eff: Record<string, string> = {};
+    const take = (key: string, current?: string, ...aliases: string[]) => {
+      let v: string | undefined;
+      for (const k of [key, ...aliases]) {
+        if (b?.[k] !== undefined) { v = b[k] === null ? "" : String(b[k]).trim(); break; }
+      }
+      eff[key] = v !== undefined ? v : (current ?? "");
+    };
+    take("kind", existing?.kind);
+    take("address", existing?.address);
+    take("assetId", existing?.assetId);
+    take("bankName", existing?.bankName);
+    take("accountNumber", existing?.accountNumber);
+    take("accountName", existing?.accountName);
+    take("country", existing?.country);
+    take("currency", existing?.currency);
+    take("momoProvider", existing?.momoProvider, "provider");
+    take("phoneNumber", existing?.phoneNumber);
+    take("network", existing?.network);
+
+    const kind = (eff.kind || "wallet") as RecipientKind;
+    if (b?.kind !== undefined && !RECIPIENT_KINDS.includes(kind)) {
+      return { error: "kind must be one of bank, momo, wallet" };
     }
-    if (!partial || b.assetId !== undefined) {
-      if (!b?.assetId || typeof b.assetId !== "string") return "assetId is required";
-      if (!(await knownAsset(String(b.assetId)))) return "assetId is not a known asset";
+    if (eff.network) {
+      if (eff.network === "POLYGON_MAINNET") {
+        return { error: "POLYGON_MAINNET is not a Nuvion network name; Polygon is MATIC_MAINNET" };
+      }
+      if (!NUVION_NETWORKS.includes(eff.network)) {
+        return { error: `network ${eff.network} is not supported; supported networks are ${NUVION_NETWORKS.join(", ")}` };
+      }
     }
-    return undefined;
+    const kindChanged = partial && b?.kind !== undefined && !!existing && kind !== existing.kind;
+    if (kind === "wallet") {
+      if (!partial || b?.address !== undefined || kindChanged) {
+        if (!eff.address) return { error: "address is required" };
+      }
+      if (!partial || b?.assetId !== undefined || kindChanged) {
+        if (!eff.assetId) return { error: "assetId is required" };
+        if (!(await knownAsset(eff.assetId))) return { error: "assetId is not a known asset" };
+      }
+      return {
+        fields: {
+          kind, address: eff.address, assetId: eff.assetId, chain: chainOf(eff.assetId),
+          network: eff.network || undefined,
+        },
+      };
+    }
+    if (kind === "bank") {
+      for (const f of ["bankName", "accountNumber", "accountName", "country", "currency"] as const) {
+        if (!eff[f]) return { error: `${f} is required for a bank recipient` };
+      }
+      return {
+        fields: {
+          kind, address: eff.accountNumber, assetId: "", chain: "",
+          bankName: eff.bankName, accountNumber: eff.accountNumber, accountName: eff.accountName,
+          country: eff.country, currency: eff.currency,
+        },
+      };
+    }
+    for (const f of ["momoProvider", "phoneNumber", "country", "currency"] as const) {
+      if (!eff[f]) return { error: `${f} is required for a momo recipient` };
+    }
+    return {
+      fields: {
+        kind, address: eff.phoneNumber, assetId: "", chain: "",
+        momoProvider: eff.momoProvider, phoneNumber: eff.phoneNumber,
+        country: eff.country, currency: eff.currency,
+      },
+    };
+  };
+
+  /**
+   * The Nuvion payment detail body for a recipient. The docs describe
+   * these shapes only in outline (method plus rail fields), so the flat
+   * field layout is a deliberate first reading, kept in this one place.
+   */
+  const nuvionPaymentDetailBody = (rec: Recipient, counterpartyId: string): CreatePaymentDetailRequest => {
+    if (rec.kind === "bank") {
+      return {
+        counterparty_id: counterpartyId, payment_method: "bank-transfer",
+        ...(rec.currency === "NGN" ? { scheme: "nip" } : {}),
+        currency: rec.currency, country: rec.country,
+        bank_name: rec.bankName, account_number: rec.accountNumber, account_name: rec.accountName,
+      };
+    }
+    if (rec.kind === "momo") {
+      return {
+        counterparty_id: counterpartyId, payment_method: "momo-transfer",
+        currency: rec.currency, country: rec.country,
+        provider: rec.momoProvider, phone_number: rec.phoneNumber,
+      };
+    }
+    return {
+      counterparty_id: counterpartyId, payment_method: "stablecoin-transfer",
+      wallet_address: rec.address, ...(rec.network ? { network: rec.network } : {}),
+    };
+  };
+
+  // Nuvion counterparty linking (fiat slice 3): create the recipient's
+  // counterparty and payment detail on the merchant's child entity and
+  // store both ids. Best effort by design, like merchant linking: a
+  // Nuvion failure never blocks recipient creation or update, the ids
+  // stay null, and both outcomes land in the ledger.
+  const linkRecipientToNuvion = async (merchant: Merchant, rec: Recipient): Promise<Recipient> => {
+    if (!nuvionClient || !merchant.nuvionEntityId) return rec;
+    try {
+      const counterparty = await nuvionClient.createCounterparty({
+        entity_id: merchant.nuvionEntityId,
+        name: rec.label || rec.accountName || rec.address,
+      });
+      const detail = await nuvionClient.createPaymentDetails(nuvionPaymentDetailBody(rec, counterparty.id));
+      const linked = store.updateRecipient(rec.merchantId, rec.id, {
+        nuvionCounterpartyId: counterparty.id, nuvionPaymentDetailId: detail.id,
+      });
+      store.addLedger({
+        merchantId: merchant.id, entityType: "recipient", entityId: rec.id,
+        kind: "nuvion_counterparty_linked", amount: "0", asset: "",
+      });
+      return linked ?? rec;
+    } catch (err) {
+      store.addLedger({
+        merchantId: merchant.id, entityType: "recipient", entityId: rec.id,
+        kind: "nuvion_counterparty_link_failed", amount: "0", asset: "",
+      });
+      console.error(`nuvion counterparty link failed for recipient ${rec.id}:`, err instanceof Error ? err.message : err);
+      return rec;
+    }
+  };
+
+  /** True when an update changed how the recipient gets paid, or touched payment fields on a recipient that was never linked. */
+  const recipientLinkNeeded = (before: Recipient, after: Recipient, b: any): boolean => {
+    if (RECIPIENT_PAYMENT_FIELDS.some((k) => before[k] !== after[k])) return true;
+    return RECIPIENT_PAYMENT_KEYS.some((k) => b?.[k] !== undefined) && !after.nuvionCounterpartyId;
   };
 
   app.post("/v1/recipients", async (req, reply) => {
     const m = req.merchant!;
     const b = req.body as any;
-    const problem = await validRecipientFields(b, false);
-    if (problem) return reply.code(400).send({ error: problem });
-    const rec = store.createRecipient({
-      merchantId: m.id, label: String(b.label ?? ""), address: String(b.address),
-      assetId: String(b.assetId), chain: chainOf(String(b.assetId)),
+    const parsed = await parseRecipientFields(b, false);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    let rec = store.createRecipient({
+      merchantId: m.id, label: String(b.label ?? ""),
       notes: b.notes ? String(b.notes) : undefined,
+      ...parsed.fields,
     });
+    rec = await linkRecipientToNuvion(m, rec);
     return reply.code(201).send(rec);
   });
 
@@ -964,14 +1138,14 @@ export function buildApp(options: BuildOptions = {}) {
     const existing = store.getRecipient(m.id, (req.params as any).id);
     if (!existing) return reply.code(404).send({ error: "recipient not found" });
     const b = (req.body ?? {}) as any;
-    const problem = await validRecipientFields(b, true);
-    if (problem) return reply.code(400).send({ error: problem });
-    const patch: Record<string, unknown> = {};
+    const parsed = await parseRecipientFields(b, true, existing);
+    if ("error" in parsed) return reply.code(400).send({ error: parsed.error });
+    const patch: Record<string, unknown> = { ...parsed.fields };
     if (b.label !== undefined) patch.label = String(b.label);
     if (b.notes !== undefined) patch.notes = b.notes === null ? undefined : String(b.notes);
-    if (b.address !== undefined) patch.address = String(b.address);
-    if (b.assetId !== undefined) { patch.assetId = String(b.assetId); patch.chain = chainOf(String(b.assetId)); }
-    return store.updateRecipient(m.id, existing.id, patch as any);
+    let rec = store.updateRecipient(m.id, existing.id, patch as any)!;
+    if (recipientLinkNeeded(existing, rec, b)) rec = await linkRecipientToNuvion(m, rec);
+    return rec;
   });
 
   app.delete("/v1/recipients/:id", async (req, reply) => {

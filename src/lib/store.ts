@@ -68,7 +68,10 @@ CREATE TABLE IF NOT EXISTS webhook_endpoints (
 CREATE TABLE IF NOT EXISTS recipients (
   id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',
   address TEXT NOT NULL, asset_id TEXT NOT NULL, chain TEXT NOT NULL DEFAULT '',
-  notes TEXT, created_at TEXT NOT NULL, updated_at TEXT
+  notes TEXT, kind TEXT, bank_name TEXT, account_number TEXT, account_name TEXT,
+  country TEXT, currency TEXT, momo_provider TEXT, phone_number TEXT, network TEXT,
+  nuvion_counterparty_id TEXT, nuvion_payment_detail_id TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS schedules (
   id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, kind TEXT NOT NULL, cadence TEXT NOT NULL,
@@ -154,6 +157,17 @@ export class Store {
     for (const col of ["nuvion_entity_id", "nuvion_entity_status", "nuvion_accounts"]) {
       if (!merchantCols.some((c) => c.name === col)) {
         this.db.exec(`ALTER TABLE merchants ADD COLUMN ${col} TEXT`);
+      }
+    }
+    // Migration for databases created before recipient kinds existed
+    // (fiat slice 3): the kind, the bank and mobile money detail
+    // columns, the wallet network, and the Nuvion counterparty link.
+    // All nullable; rows saved before this read back as kind "wallet".
+    const recipientCols = this.db.prepare("PRAGMA table_info(recipients)").all() as Array<{ name: string }>;
+    for (const col of ["kind", "bank_name", "account_number", "account_name", "country", "currency",
+      "momo_provider", "phone_number", "network", "nuvion_counterparty_id", "nuvion_payment_detail_id"]) {
+      if (!recipientCols.some((c) => c.name === col)) {
+        this.db.exec(`ALTER TABLE recipients ADD COLUMN ${col} TEXT`);
       }
     }
   }
@@ -454,13 +468,27 @@ export class Store {
   }
 
   // ---- recipients (address book) ----
-  createRecipient(input: { merchantId: string; label: string; address: string; assetId: string; chain: string; notes?: string }): Recipient {
+  createRecipient(input: {
+    merchantId: string; label: string; address: string; assetId: string; chain: string; notes?: string;
+    kind?: Recipient["kind"]; bankName?: string; accountNumber?: string; accountName?: string;
+    country?: string; currency?: string; momoProvider?: string; phoneNumber?: string; network?: string;
+    nuvionCounterpartyId?: string; nuvionPaymentDetailId?: string;
+  }): Recipient {
     const r: Recipient = {
       id: uid("rcp"), merchantId: input.merchantId, label: input.label, address: input.address,
-      assetId: input.assetId, chain: input.chain, notes: input.notes, createdAt: now(),
+      assetId: input.assetId, chain: input.chain, notes: input.notes, kind: input.kind ?? "wallet",
+      bankName: input.bankName, accountNumber: input.accountNumber, accountName: input.accountName,
+      country: input.country, currency: input.currency, momoProvider: input.momoProvider,
+      phoneNumber: input.phoneNumber, network: input.network,
+      nuvionCounterpartyId: input.nuvionCounterpartyId, nuvionPaymentDetailId: input.nuvionPaymentDetailId,
+      createdAt: now(),
     };
-    this.db.prepare("INSERT INTO recipients (id,merchant_id,label,address,asset_id,chain,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
-      .run(r.id, r.merchantId, r.label, r.address, r.assetId, r.chain, r.notes ?? null, r.createdAt, r.createdAt);
+    this.db.prepare(`INSERT INTO recipients (id,merchant_id,label,address,asset_id,chain,notes,kind,bank_name,account_number,account_name,country,currency,momo_provider,phone_number,network,nuvion_counterparty_id,nuvion_payment_detail_id,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(r.id, r.merchantId, r.label, r.address, r.assetId, r.chain, r.notes ?? null, r.kind,
+        r.bankName ?? null, r.accountNumber ?? null, r.accountName ?? null, r.country ?? null,
+        r.currency ?? null, r.momoProvider ?? null, r.phoneNumber ?? null, r.network ?? null,
+        r.nuvionCounterpartyId ?? null, r.nuvionPaymentDetailId ?? null, r.createdAt, r.createdAt);
     return r;
   }
 
@@ -477,8 +505,14 @@ export class Store {
     const cur = this.getRecipient(merchantId, id);
     if (!cur) return undefined;
     const next = { ...cur, ...patch, updatedAt: now() };
-    this.db.prepare("UPDATE recipients SET label=?, address=?, asset_id=?, chain=?, notes=?, updated_at=? WHERE merchant_id=? AND id=?")
-      .run(next.label, next.address, next.assetId, next.chain, next.notes ?? null, next.updatedAt, merchantId, id);
+    this.db.prepare(`UPDATE recipients SET label=?, address=?, asset_id=?, chain=?, notes=?, kind=?,
+      bank_name=?, account_number=?, account_name=?, country=?, currency=?, momo_provider=?,
+      phone_number=?, network=?, nuvion_counterparty_id=?, nuvion_payment_detail_id=?, updated_at=?
+      WHERE merchant_id=? AND id=?`)
+      .run(next.label, next.address, next.assetId, next.chain, next.notes ?? null, next.kind,
+        next.bankName ?? null, next.accountNumber ?? null, next.accountName ?? null, next.country ?? null,
+        next.currency ?? null, next.momoProvider ?? null, next.phoneNumber ?? null, next.network ?? null,
+        next.nuvionCounterpartyId ?? null, next.nuvionPaymentDetailId ?? null, next.updatedAt, merchantId, id);
     return next;
   }
 
@@ -492,7 +526,15 @@ export class Store {
   private rowRecipient(r: any): Recipient {
     return {
       id: r.id, merchantId: r.merchant_id, label: r.label, address: r.address, assetId: r.asset_id,
-      chain: r.chain, notes: r.notes ?? undefined, createdAt: r.created_at, updatedAt: r.updated_at ?? undefined,
+      chain: r.chain, notes: r.notes ?? undefined,
+      kind: (r.kind as Recipient["kind"]) || "wallet",
+      bankName: r.bank_name ?? undefined, accountNumber: r.account_number ?? undefined,
+      accountName: r.account_name ?? undefined, country: r.country ?? undefined,
+      currency: r.currency ?? undefined, momoProvider: r.momo_provider ?? undefined,
+      phoneNumber: r.phone_number ?? undefined, network: r.network ?? undefined,
+      nuvionCounterpartyId: r.nuvion_counterparty_id ?? undefined,
+      nuvionPaymentDetailId: r.nuvion_payment_detail_id ?? undefined,
+      createdAt: r.created_at, updatedAt: r.updated_at ?? undefined,
     };
   }
 

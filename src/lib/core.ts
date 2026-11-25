@@ -74,6 +74,9 @@ export interface Payout {
   updatedAt?: string;
 }
 
+/** How a recipient gets paid (fiat slice 3). Wallet is the original stablecoin address book shape. */
+export type RecipientKind = "bank" | "momo" | "wallet";
+
 export interface Recipient {
   id: string;
   merchantId: string;
@@ -83,6 +86,28 @@ export interface Recipient {
   /** Chain key derived from the asset (for example "near", "base"). */
   chain: string;
   notes?: string;
+  /** Payment kind. Rows saved before kinds existed read back as "wallet". */
+  kind: RecipientKind;
+  /** Bank kind: the bank's name. */
+  bankName?: string;
+  /** Bank kind: the account number. Also mirrored into address, the column payouts resolve. */
+  accountNumber?: string;
+  /** Bank kind: the name on the account. */
+  accountName?: string;
+  /** Bank and momo kinds: ISO country code the account or wallet lives in. */
+  country?: string;
+  /** Bank and momo kinds: ISO currency code the recipient is paid in. */
+  currency?: string;
+  /** Momo kind: the mobile money network (for example MTN, M-Pesa). */
+  momoProvider?: string;
+  /** Momo kind: the phone number on the wallet. Also mirrored into address. */
+  phoneNumber?: string;
+  /** Wallet kind: the Nuvion network name (ETH_MAINNET, BASE_MAINNET, MATIC_MAINNET, SOLANA_MAINNET), when recorded. */
+  network?: string;
+  /** Nuvion counterparty created for this recipient, once linked. */
+  nuvionCounterpartyId?: string;
+  /** Nuvion payment detail created for this recipient, once linked. */
+  nuvionPaymentDetailId?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -164,7 +189,7 @@ export interface RegistryEvent {
 export interface LedgerEntry {
   id: string;
   merchantId?: string;
-  entityType: "invoice" | "payout" | "batch" | "merchant";
+  entityType: "invoice" | "payout" | "batch" | "merchant" | "recipient";
   entityId: string;
   kind: string;
   amount: string;
