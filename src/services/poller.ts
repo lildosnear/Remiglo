@@ -1,6 +1,7 @@
-import { reconcile, PAYOUT_TERMINAL } from "../lib/core.js";
+import { reconcile, PAYOUT_TERMINAL, type Payout } from "../lib/core.js";
 import type { Store } from "../lib/store.js";
 import { mapPayoutStatus, mapStatus, type IntentsClient } from "./intents.js";
+import { mapNuvionPayoutStatus, type NuvionClient } from "./nuvion.js";
 import { enqueueEvent, processPendingDeliveries, type FetchFn, type WebhookConfig } from "./webhooks.js";
 import { runDueSchedules, type ScheduleRunResult, type ScheduleServices } from "./schedules.js";
 import type { IndexerRunResult } from "./indexer.js";
@@ -10,6 +11,8 @@ export interface SyncDeps {
   intents: IntentsClient;
   fetchFn: FetchFn;
   webhookCfg: WebhookConfig;
+  /** When set, each sync cycle also polls open Nuvion transfers and drains recorded Nuvion webhook events. */
+  nuvion?: NuvionClient;
   /** When set, each sync cycle also ticks the schedule runner. */
   scheduleServices?: ScheduleServices;
   /** When set, each sync cycle also runs one registry indexing pass. */
@@ -21,6 +24,9 @@ export interface SyncResult {
   invoicesUpdated: number;
   payoutsChecked: number;
   payoutsUpdated: number;
+  nuvionEventsApplied: number;
+  nuvionPayoutsChecked: number;
+  nuvionPayoutsUpdated: number;
   batchesCompleted: number;
   errors: number;
   schedules?: ScheduleRunResult;
@@ -45,25 +51,80 @@ const PAYOUT_EVENT: Record<string, string> = {
 
 /**
  * payout.sent fires exactly once per payout: on the first transition
- * out of the awaiting states (awaiting_funding, quoted) into a state
- * where the deposit is on its way (funded, processing). A payout that
- * later moves funded -> processing does not fire it again, because its
- * previous state is no longer an awaiting state.
+ * out of the awaiting states (awaiting_funding, quoted, and the Nuvion
+ * queued state sent) into a state where the money is on its way
+ * (funded, processing). A payout that later moves funded -> processing
+ * does not fire it again, because its previous state is no longer an
+ * awaiting state.
  */
-export const PAYOUT_SENT_FROM = ["awaiting_funding", "quoted"];
+export const PAYOUT_SENT_FROM = ["awaiting_funding", "quoted", "sent"];
 export const PAYOUT_SENT_TO = ["funded", "processing"];
+
+/**
+ * THE payout transition path (fiat slice 4). Every payout status change
+ * after creation, from either rail, goes through here: the status
+ * write, one ledger entry, the payout.sent / settled / failed merchant
+ * webhooks, all identical. Returns true when the status changed. The
+ * caller owns batch completion checks (see completeBatchIfDone),
+ * because during batch creation not all rows exist yet.
+ */
+export function applyPayoutTransition(
+  store: Store,
+  pay: Payout,
+  mapped: string,
+  detail?: { amountOut?: string; txHash?: string },
+): boolean {
+  if (mapped === pay.status) return false;
+  store.updatePayout(pay.id, { status: mapped, amountOut: detail?.amountOut ?? pay.amountOut });
+  store.addLedger({
+    merchantId: pay.merchantId, entityType: "payout", entityId: pay.id,
+    kind: `payout_${mapped}`, amount: detail?.amountOut ?? pay.amount,
+    asset: pay.destinationAsset, txHash: detail?.txHash,
+  });
+  const refData = {
+    ...(pay.reference ? { reference: pay.reference } : {}),
+    ...(pay.grossAmount ? { grossAmount: pay.grossAmount, retentionAmount: pay.retentionAmount, deductionsAmount: pay.deductionsAmount } : {}),
+  };
+  if (PAYOUT_SENT_FROM.includes(pay.status) && PAYOUT_SENT_TO.includes(mapped)) {
+    enqueueEvent(store, pay.merchantId, "payout.sent", pay.id, { payoutId: pay.id, status: mapped, batchId: pay.batchId, ...refData });
+  }
+  const event = PAYOUT_EVENT[mapped];
+  if (event) enqueueEvent(store, pay.merchantId, event, pay.id, { payoutId: pay.id, status: mapped, batchId: pay.batchId, ...refData });
+  return true;
+}
+
+/**
+ * Complete a batch when every one of its payouts is terminal. Only
+ * batches still active can complete; the poller calls this for batches
+ * a transition touched, never during batch creation.
+ */
+export function completeBatchIfDone(store: Store, batchId: string): boolean {
+  const batch = store.getBatchById(batchId);
+  if (!batch || batch.status !== "active") return false;
+  const rows = store.payoutsByBatch(batchId);
+  if (rows.length === 0 || !rows.every((r) => PAYOUT_TERMINAL.includes(r.status))) return false;
+  store.updateBatch(batchId, { status: "completed" });
+  store.addLedger({ merchantId: batch.merchantId, entityType: "batch", entityId: batchId, kind: "batch_completed", amount: batch.totalAmount, asset: rows[0].destinationAsset });
+  enqueueEvent(store, batch.merchantId, "batch.completed", batchId, { batchId, status: "completed", totalAmount: batch.totalAmount });
+  return true;
+}
+
+/** Nuvion outflow webhook types that carry a payout transition. */
+export const NUVION_OUTFLOW_EVENTS = ["outflows.created", "outflows.completed", "outflows.failed", "outflows.cancelled"];
 
 /**
  * One sync cycle. Polls every open invoice and funded payout, applies at
  * most one transition per entity, writes a ledger entry per transition and
  * enqueues a webhook per transition. Per entity errors are caught and left
- * for the next cycle. Then due webhook deliveries are attempted and batch
- * completion is checked.
+ * for the next cycle. Then recorded Nuvion webhook events are drained and
+ * open Nuvion transfers are polled (when a Nuvion client is wired), due
+ * webhook deliveries are attempted and batch completion is checked.
  */
 export async function syncOnce(deps: SyncDeps): Promise<SyncResult> {
   const { store, intents } = deps;
   const result: SyncResult = {
     invoicesChecked: 0, invoicesUpdated: 0, payoutsChecked: 0, payoutsUpdated: 0,
+    nuvionEventsApplied: 0, nuvionPayoutsChecked: 0, nuvionPayoutsUpdated: 0,
     batchesCompleted: 0, errors: 0, webhooks: { attempted: 0, delivered: 0, failed: 0 },
   };
 
@@ -118,23 +179,9 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncResult> {
     try {
       const st = await intents.status(pay.depositAddress!);
       const mapped = mapPayoutStatus(st.status);
-      if (mapped === pay.status) continue;
-      store.updatePayout(pay.id, { status: mapped, amountOut: st.swapDetails?.amountOut ?? pay.amountOut });
       const txHash = st.swapDetails?.destinationChainTxHashes?.[0]?.hash ?? st.swapDetails?.originChainTxHashes?.[0]?.hash;
-      store.addLedger({
-        merchantId: pay.merchantId, entityType: "payout", entityId: pay.id,
-        kind: `payout_${mapped}`, amount: st.swapDetails?.amountOut ?? pay.amount,
-        asset: pay.destinationAsset, txHash,
-      });
-      const refData = {
-        ...(pay.reference ? { reference: pay.reference } : {}),
-        ...(pay.grossAmount ? { grossAmount: pay.grossAmount, retentionAmount: pay.retentionAmount, deductionsAmount: pay.deductionsAmount } : {}),
-      };
-      if (PAYOUT_SENT_FROM.includes(pay.status) && PAYOUT_SENT_TO.includes(mapped)) {
-        enqueueEvent(store, pay.merchantId, "payout.sent", pay.id, { payoutId: pay.id, status: mapped, batchId: pay.batchId, ...refData });
-      }
-      const event = PAYOUT_EVENT[mapped];
-      if (event) enqueueEvent(store, pay.merchantId, event, pay.id, { payoutId: pay.id, status: mapped, batchId: pay.batchId, ...refData });
+      const changed = applyPayoutTransition(store, pay, mapped, { amountOut: st.swapDetails?.amountOut, txHash });
+      if (!changed) continue;
       if (pay.batchId) touchedBatches.add(pay.batchId);
       result.payoutsUpdated += 1;
     } catch {
@@ -142,18 +189,54 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncResult> {
     }
   }
 
+  // Nuvion pass (fiat slice 4). Two halves, one transition path:
+  // recorded webhook events are drained first (a webhook is a trigger
+  // to read the transfer's current state, never the state itself),
+  // then every open Nuvion payout is polled as the backstop for
+  // webhooks that never arrive. Both apply transitions through
+  // applyPayoutTransition, exactly like the Intents loop above.
+  if (deps.nuvion) {
+    const nuvion = deps.nuvion;
+    for (const ev of store.unappliedNuvionEvents()) {
+      try {
+        if (NUVION_OUTFLOW_EVENTS.includes(ev.eventType) && ev.transferId) {
+          const pay = store.payoutByProviderRef(ev.transferId);
+          if (pay && !PAYOUT_TERMINAL.includes(pay.status)) {
+            const t = await nuvion.getTransfer(ev.transferId);
+            const changed = applyPayoutTransition(store, pay, mapNuvionPayoutStatus(t.status));
+            if (changed) {
+              if (pay.batchId) touchedBatches.add(pay.batchId);
+              result.nuvionPayoutsUpdated += 1;
+            }
+          }
+        }
+        // Unknown types, and events whose payout is unknown or already
+        // terminal, are applied with no action: the poller backstop
+        // below owns the state, and an event must never drain forever.
+        store.markNuvionEventApplied(ev.id);
+        result.nuvionEventsApplied += 1;
+      } catch {
+        result.errors += 1; // left unapplied; the next cycle retries it
+      }
+    }
+    for (const pay of store.openNuvionPayouts()) {
+      result.nuvionPayoutsChecked += 1;
+      try {
+        const t = await nuvion.getTransfer(pay.providerRef!);
+        const changed = applyPayoutTransition(store, pay, mapNuvionPayoutStatus(t.status));
+        if (!changed) continue;
+        if (pay.batchId) touchedBatches.add(pay.batchId);
+        result.nuvionPayoutsUpdated += 1;
+      } catch {
+        result.errors += 1;
+      }
+    }
+  }
+
   // Batch completion: every payout terminal means the batch is done.
   for (const batchId of touchedBatches) {
     try {
-      const batch = store.getBatchById(batchId);
-      if (!batch || batch.status !== "active") continue;
-      const rows = store.payoutsByBatch(batchId);
-      if (rows.length > 0 && rows.every((r) => PAYOUT_TERMINAL.includes(r.status))) {
-        store.updateBatch(batchId, { status: "completed" });
-        store.addLedger({ merchantId: batch.merchantId, entityType: "batch", entityId: batchId, kind: "batch_completed", amount: batch.totalAmount, asset: rows[0].destinationAsset });
-        enqueueEvent(store, batch.merchantId, "batch.completed", batchId, { batchId, status: "completed", totalAmount: batch.totalAmount });
-        result.batchesCompleted += 1;
-      }
+      if (completeBatchIfDone(store, batchId)) result.batchesCompleted += 1;
     } catch {
       result.errors += 1;
     }

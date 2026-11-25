@@ -70,6 +70,14 @@ export interface Payout {
   grossAmount?: string;
   retentionAmount?: string;
   deductionsAmount?: string;
+  /** The saved recipient this payout was created from, when it came by recipientId. */
+  recipientId?: string;
+  /** Nuvion transfer id (fiat slice 4). Set only on Nuvion bound rows; the join key for status reads and webhooks. */
+  providerRef?: string;
+  /** Nuvion bound rows: the fiat currency the recipient is paid in (from the recipient record). */
+  fiatCurrency?: string;
+  /** Nuvion bound rows: the amount in Nuvion's 2 decimal smallest units, as a string. */
+  fiatAmount?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -202,6 +210,25 @@ export interface WebhookEndpoint {
   id: string;
   merchantId: string;
   url: string;
+  createdAt: string;
+}
+
+/**
+ * One inbound Nuvion webhook delivery, recorded verbatim (fiat slice 4).
+ * The receiver only records; the sync loop drains unapplied events and
+ * applies their transitions, so a slow or failed application never
+ * blocks the 2xx answer Nuvion's blacklist rule depends on.
+ */
+export interface NuvionEvent {
+  id: string;
+  /** The provider's own event id, when the payload carries one. */
+  providerEventId?: string;
+  eventType: string;
+  /** The Nuvion transfer id extracted from the payload, when present. */
+  transferId?: string;
+  /** The raw request body, exactly as received. */
+  payload: string;
+  applied: boolean;
   createdAt: string;
 }
 

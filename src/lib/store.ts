@@ -20,7 +20,7 @@ const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
-  DashRole, DashUser, Invoice, LedgerEntry, Merchant, Payout, PayoutBatch, Recipient, RegistryEvent,
+  DashRole, DashUser, Invoice, LedgerEntry, Merchant, NuvionEvent, Payout, PayoutBatch, Recipient, RegistryEvent,
   Schedule, ScheduleRun, WebhookDelivery, WebhookEndpoint,
 } from "./core.js";
 
@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS payouts (
   refund_to TEXT, amount TEXT NOT NULL, status TEXT NOT NULL, deposit_address TEXT,
   amount_out TEXT, idempotency_key TEXT, retry_of TEXT, reference TEXT,
   gross_amount TEXT, retention_amount TEXT, deductions_amount TEXT,
+  recipient_id TEXT, provider_ref TEXT, fiat_currency TEXT, fiat_amount TEXT,
   created_at TEXT NOT NULL, updated_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payout_idem ON payouts(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -108,6 +109,11 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
   attempt_log TEXT NOT NULL DEFAULT '[]', last_status_code INTEGER, last_error TEXT,
   created_at TEXT NOT NULL, updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS nuvion_events (
+  id TEXT PRIMARY KEY, provider_event_id TEXT, event_type TEXT NOT NULL,
+  transfer_id TEXT, payload TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
 `;
 
 const now = () => new Date().toISOString();
@@ -146,6 +152,14 @@ export class Store {
     // Migration for databases created before payment references and
     // gross / retention / deductions breakdowns existed.
     for (const col of ["reference", "gross_amount", "retention_amount", "deductions_amount"]) {
+      if (!payoutCols.some((c) => c.name === col)) {
+        this.db.exec(`ALTER TABLE payouts ADD COLUMN ${col} TEXT`);
+      }
+    }
+    // Migration for databases created before Nuvion payout execution
+    // (fiat slice 4): the recipient the row came from, and the Nuvion
+    // transfer reference plus the fiat denomination of the row.
+    for (const col of ["recipient_id", "provider_ref", "fiat_currency", "fiat_amount"]) {
       if (!payoutCols.some((c) => c.name === col)) {
         this.db.exec(`ALTER TABLE payouts ADD COLUMN ${col} TEXT`);
       }
@@ -366,12 +380,13 @@ export class Store {
 
   // ---- payouts and batches ----
   createPayout(p: Payout) {
-    this.db.prepare(`INSERT INTO payouts (id,merchant_id,batch_id,recipient_address,destination_asset,origin_asset,refund_to,amount,status,deposit_address,amount_out,idempotency_key,retry_of,reference,gross_amount,retention_amount,deductions_amount,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    this.db.prepare(`INSERT INTO payouts (id,merchant_id,batch_id,recipient_address,destination_asset,origin_asset,refund_to,amount,status,deposit_address,amount_out,idempotency_key,retry_of,reference,gross_amount,retention_amount,deductions_amount,recipient_id,provider_ref,fiat_currency,fiat_amount,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(p.id, p.merchantId, p.batchId ?? null, p.recipientAddress, p.destinationAsset, p.originAsset,
         p.refundTo ?? null, p.amount, p.status, p.depositAddress ?? null, p.amountOut ?? null,
         p.idempotencyKey ?? null, p.retryOfId ?? null, p.reference ?? null,
         p.grossAmount ?? null, p.retentionAmount ?? null, p.deductionsAmount ?? null,
+        p.recipientId ?? null, p.providerRef ?? null, p.fiatCurrency ?? null, p.fiatAmount ?? null,
         p.createdAt, p.createdAt);
     return p;
   }
@@ -403,12 +418,24 @@ export class Store {
     return (this.db.prepare("SELECT * FROM payouts WHERE status IN ('awaiting_funding','funded','processing','quoted') AND deposit_address IS NOT NULL").all() as any[]).map((r) => this.rowPayout(r));
   }
 
+  /** Nuvion bound payouts still in flight (fiat slice 4): keyed on the stored transfer reference, not a deposit address. */
+  openNuvionPayouts(): Payout[] {
+    return (this.db.prepare("SELECT * FROM payouts WHERE provider_ref IS NOT NULL AND status NOT IN ('settled','failed','refunded')").all() as any[]).map((r) => this.rowPayout(r));
+  }
+
+  /** The payout a Nuvion transfer belongs to, found by its stored transfer id. */
+  payoutByProviderRef(providerRef: string): Payout | undefined {
+    const r = this.db.prepare("SELECT * FROM payouts WHERE provider_ref = ?").get(providerRef) as any;
+    return r ? this.rowPayout(r) : undefined;
+  }
+
   updatePayout(id: string, patch: Partial<Payout>) {
     const cur = this.db.prepare("SELECT * FROM payouts WHERE id = ?").get(id) as any;
     if (!cur) return undefined;
     const next = { ...this.rowPayout(cur), ...patch, updatedAt: now() };
-    this.db.prepare(`UPDATE payouts SET status=?, deposit_address=?, amount_out=?, updated_at=? WHERE id=?`)
-      .run(next.status, next.depositAddress ?? null, next.amountOut ?? null, next.updatedAt, id);
+    this.db.prepare(`UPDATE payouts SET status=?, deposit_address=?, amount_out=?, provider_ref=?, fiat_currency=?, fiat_amount=?, updated_at=? WHERE id=?`)
+      .run(next.status, next.depositAddress ?? null, next.amountOut ?? null, next.providerRef ?? null,
+        next.fiatCurrency ?? null, next.fiatAmount ?? null, next.updatedAt, id);
     return next;
   }
 
@@ -421,6 +448,8 @@ export class Store {
       retryOfId: r.retry_of ?? undefined, reference: r.reference ?? undefined,
       grossAmount: r.gross_amount ?? undefined, retentionAmount: r.retention_amount ?? undefined,
       deductionsAmount: r.deductions_amount ?? undefined,
+      recipientId: r.recipient_id ?? undefined, providerRef: r.provider_ref ?? undefined,
+      fiatCurrency: r.fiat_currency ?? undefined, fiatAmount: r.fiat_amount ?? undefined,
       createdAt: r.created_at, updatedAt: r.updated_at ?? undefined,
     };
   }
@@ -757,6 +786,38 @@ export class Store {
       `INSERT INTO indexer_state (contract_id,last_height,updated_at) VALUES (?,?,?)
        ON CONFLICT(contract_id) DO UPDATE SET last_height=excluded.last_height, updated_at=excluded.updated_at`
     ).run(contractId, height, now());
+  }
+
+  // ---- inbound Nuvion webhook events (fiat slice 4) ----
+  /** Record one received event verbatim. The sync loop applies it later. */
+  recordNuvionEvent(input: { providerEventId?: string; eventType: string; transferId?: string; payload: string }): NuvionEvent {
+    const ev: NuvionEvent = {
+      id: uid("nve"), providerEventId: input.providerEventId, eventType: input.eventType,
+      transferId: input.transferId, payload: input.payload, applied: false, createdAt: now(),
+    };
+    this.db.prepare("INSERT INTO nuvion_events (id,provider_event_id,event_type,transfer_id,payload,applied,created_at) VALUES (?,?,?,?,?,?,?)")
+      .run(ev.id, ev.providerEventId ?? null, ev.eventType, ev.transferId ?? null, ev.payload, 0, ev.createdAt);
+    return ev;
+  }
+
+  unappliedNuvionEvents(): NuvionEvent[] {
+    return (this.db.prepare("SELECT * FROM nuvion_events WHERE applied = 0 ORDER BY created_at, id").all() as any[]).map((r) => this.rowNuvionEvent(r));
+  }
+
+  listNuvionEvents(): NuvionEvent[] {
+    return (this.db.prepare("SELECT * FROM nuvion_events ORDER BY created_at, id").all() as any[]).map((r) => this.rowNuvionEvent(r));
+  }
+
+  markNuvionEventApplied(id: string): void {
+    this.db.prepare("UPDATE nuvion_events SET applied = 1 WHERE id = ?").run(id);
+  }
+
+  private rowNuvionEvent(r: any): NuvionEvent {
+    return {
+      id: r.id, providerEventId: r.provider_event_id ?? undefined, eventType: r.event_type,
+      transferId: r.transfer_id ?? undefined, payload: r.payload, applied: r.applied === 1,
+      createdAt: r.created_at,
+    };
   }
 }
 

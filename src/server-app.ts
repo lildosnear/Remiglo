@@ -1,4 +1,5 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import QRCode from "qrcode";
@@ -19,12 +20,12 @@ import { BUILTIN_ASSETS, builtinAsset, chainNameFor, guessAsset, parseDecimalToU
 import { renderPayNotFound, renderPayPage } from "./lib/paypage.js";
 import { parseBatchCsv } from "./lib/csv.js";
 import { getIntentsClient, MockIntents, type IntentsClient } from "./services/intents.js";
-import { getNuvionClient, MockNuvion, type CreatePaymentDetailRequest, type NuvionClient } from "./services/nuvion.js";
+import { getNuvionClient, MockNuvion, chainUnitsToNuvionUnits, mapNuvionPayoutStatus, type CreatePaymentDetailRequest, type NuvionClient } from "./services/nuvion.js";
 import { NearRegistry, type RegistryClient } from "./services/registry.js";
 import { indexOnce, indexerStatus } from "./services/indexer.js";
 import { NearRpc } from "./services/nearTx.js";
 import type { Payout, PayoutRow, Recipient, RecipientKind } from "./lib/core.js";
-import { syncOnce } from "./services/poller.js";
+import { applyPayoutTransition, syncOnce } from "./services/poller.js";
 import { firstRunAt, type ScheduleServices } from "./services/schedules.js";
 import {
   defaultFetch, deliverDelivery, enqueueEvent, webhookConfigFromEnv, type FetchFn, type WebhookConfig,
@@ -49,6 +50,11 @@ export interface AppConfig {
   // Nuvion merchant linking (fiat slice 2): currencies that get an
   // account opened for a merchant once its Nuvion entity is approved.
   nuvionCurrencies: string[];
+  // Inbound Nuvion webhooks (fiat slice 4): the HMAC secret and the
+  // header the signature arrives in. No secret configured means
+  // deliveries are accepted unverified (development and mock mode).
+  nuvionWebhookSecret?: string;
+  nuvionWebhookSignatureHeader: string;
 }
 
 export interface BuildOptions {
@@ -79,6 +85,9 @@ export function resolveConfig(partial?: Partial<AppConfig>): AppConfig {
     nearArchivalRpcUrl: partial?.nearArchivalRpcUrl ?? process.env.NEAR_ARCHIVAL_RPC_URL,
     nuvionCurrencies: partial?.nuvionCurrencies
       ?? (process.env.NUVION_CURRENCIES ?? "NGN,USD").split(",").map((c) => c.trim()).filter(Boolean),
+    nuvionWebhookSecret: partial?.nuvionWebhookSecret ?? process.env.NUVION_WEBHOOK_SECRET,
+    nuvionWebhookSignatureHeader: partial?.nuvionWebhookSignatureHeader
+      ?? process.env.NUVION_WEBHOOK_SIGNATURE_HEADER ?? "x-nuvion-signature",
   };
 }
 
@@ -652,7 +661,8 @@ export function buildApp(options: BuildOptions = {}) {
     for (const row of parsed.rows) {
       const resolved = resolvePayoutRow(m, row);
       if (resolved.error) return back({ error: resolved.error });
-      const problem = validPayoutRow(resolved.row);
+      const rec = recipientForRow(m, resolved.row);
+      const problem = validPayoutRow(resolved.row, { nuvionBound: isNuvionBound(rec) }) ?? nuvionRowProblem(m, resolved.row, rec);
       if (problem) return back({ error: problem });
       resolvedRows.push(resolved.row);
     }
@@ -740,6 +750,54 @@ export function buildApp(options: BuildOptions = {}) {
       amountOut: inv.observedAmount ?? inv.amountOut ?? null,
       updatedAt: inv.updatedAt ?? inv.createdAt,
     };
+  });
+
+  // ---- inbound Nuvion webhooks (fiat slice 4) ----
+  // Remiglo's first inbound webhook. Public by necessity (Nuvion calls
+  // it, not a merchant), so authenticity is the HMAC signature when a
+  // secret is configured. The handler only verifies and records: it
+  // answers 2xx immediately and the sync loop applies the transitions
+  // later, because an endpoint that fails delivery three times in 24
+  // hours is blacklisted by Nuvion and there is no replay. The route
+  // lives in an encapsulated scope whose JSON parser keeps the raw
+  // body string, which the signature check needs byte for byte.
+  app.register(async (instance) => {
+    instance.addContentTypeParser("application/json", { parseAs: "string" }, (_req, body, done) => {
+      done(null, body as string);
+    });
+    instance.post("/webhooks/nuvion", async (req, reply) => {
+      const raw = typeof req.body === "string" ? req.body : "";
+      if (cfg.nuvionWebhookSecret) {
+        const provided = String(req.headers[cfg.nuvionWebhookSignatureHeader.toLowerCase()] ?? "")
+          .replace(/^sha256=/, "").trim().toLowerCase();
+        const expected = createHmac("sha256", cfg.nuvionWebhookSecret).update(raw).digest("hex");
+        const ok = provided.length === expected.length
+          && timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+        if (!ok) return reply.code(401).send({ error: "invalid webhook signature" });
+      } else {
+        console.log("nuvion webhook accepted without signature verification (NUVION_WEBHOOK_SECRET is not configured)");
+      }
+      let payload: any;
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        return reply.code(400).send({ error: "webhook body is not valid JSON" });
+      }
+      // Assumed payload shape (the docs confirm the event names and the
+      // HMAC scheme, not the envelope): { id, type, data: <transfer> },
+      // with the event name under type (or event) and the transfer
+      // object under data, so the transfer id is data.id. The fallbacks
+      // keep a differently nested delivery findable.
+      const data = (payload?.data ?? payload) as any;
+      const transferId = data?.id ?? data?.transfer_id ?? payload?.transfer_id ?? data?.transfer?.id;
+      store.recordNuvionEvent({
+        providerEventId: payload?.id ?? payload?.event_id,
+        eventType: String(payload?.type ?? payload?.event ?? "unknown"),
+        transferId: transferId !== undefined ? String(transferId) : undefined,
+        payload: raw,
+      });
+      return reply.code(200).send({ received: true });
+    });
   });
 
   // ---- merchants ----
@@ -1157,28 +1215,156 @@ export function buildApp(options: BuildOptions = {}) {
   /**
    * Resolve a payout row that references a saved recipient. The resolved
    * row carries the recipient's address and asset, so stored batch rows
-   * stay valid even if the recipient is later edited or deleted.
+   * stay valid even if the recipient is later edited or deleted. A bank
+   * or mobile money recipient has no asset id; what the row pays in is
+   * the recipient's currency, so that becomes its destination asset.
    */
   const resolvePayoutRow = (m: Merchant, row: any): { row?: any; error?: string } => {
     if (!row?.recipientId) return { row };
     const rec = store.getRecipient(m.id, String(row.recipientId));
     if (!rec) return { error: `recipient ${String(row.recipientId)} not found` };
-    return { row: { ...row, recipientAddress: rec.address, destinationAsset: rec.assetId } };
+    const destinationAsset = rec.kind === "wallet" ? rec.assetId : (rec.currency ?? rec.assetId);
+    return { row: { ...row, recipientAddress: rec.address, destinationAsset } };
+  };
+
+  /** The saved recipient a row came from, when it carries a recipientId. */
+  const recipientForRow = (m: Merchant, row: any): Recipient | undefined => {
+    if (!row?.recipientId) return undefined;
+    return store.getRecipient(m.id, String(row.recipientId));
+  };
+
+  /** A row is Nuvion bound when it resolves to a bank or mobile money recipient (fiat slice 4). */
+  const isNuvionBound = (rec?: Recipient): boolean => !!rec && (rec.kind === "bank" || rec.kind === "momo");
+
+  /**
+   * Creation time refusals for a Nuvion bound row. Such a row can only
+   * ever execute through Nuvion, so when the rail is unavailable (no
+   * client configured, merchant not linked) or the amount cannot cross
+   * the 2 decimal boundary exactly, the row is refused here, before
+   * anything is created, with the reason stated plainly.
+   */
+  const nuvionRowProblem = (m: Merchant, row: any, rec?: Recipient): string | undefined => {
+    if (!isNuvionBound(rec)) return undefined;
+    if (!nuvionClient) return "this recipient is paid in fiat, but Nuvion is not configured on this instance";
+    if (!m.nuvionEntityId) return "this recipient is paid in fiat, but the merchant is not linked to a Nuvion entity";
+    if (!rec!.currency) return "the recipient has no payout currency recorded";
+    try {
+      chainUnitsToNuvionUnits(String(row.amount ?? ""));
+    } catch {
+      return "a fiat payout amount must be exact to the cent (two decimal places)";
+    }
+    return undefined;
   };
 
   // ---- payouts ----
+  /**
+   * Execute one Nuvion bound payout (fiat slice 4, Flow A). Mirrors the
+   * Intents quote step's place in the flow: the external call happens
+   * first and the payout record is created only once the transfer
+   * exists, so an execution failure leaves no record, exactly like a
+   * quote failure. Any throw is the execution failure the batch
+   * semantics in createBatchFor and approveBatchFor already handle.
+   */
+  const executeNuvionPayoutFor = async (
+    m: Merchant, row: any, rec: Recipient,
+    opts: { batchId?: string; idem?: string; retryOf?: string; originAsset: string; breakdown: Record<string, string | undefined> },
+  ) => {
+    if (!nuvionClient) throw new Error("this recipient is paid in fiat, but Nuvion is not configured on this instance");
+    if (!m.nuvionEntityId) throw new Error("this recipient is paid in fiat, but the merchant is not linked to a Nuvion entity");
+    const payoutCurrency = rec.currency;
+    if (!payoutCurrency) throw new Error("the recipient has no payout currency recorded");
+    // Throws when the amount is not exact to the cent; creation routes
+    // refuse such rows up front, so this is the backstop for paths that
+    // reach execution directly (schedule runs, retries).
+    const fiatAmount = chainUnitsToNuvionUnits(String(row.amount));
+
+    // (a) The recipient's counterparty and payment detail must exist.
+    // Slice 3 creates them at recipient creation; a recipient that
+    // predates the link, or whose link failed, is linked now.
+    let linked = rec;
+    if (!linked.nuvionCounterpartyId || !linked.nuvionPaymentDetailId) {
+      linked = await linkRecipientToNuvion(m, linked);
+    }
+    if (!linked.nuvionCounterpartyId || !linked.nuvionPaymentDetailId) {
+      throw new Error("the recipient could not be linked to a Nuvion counterparty");
+    }
+
+    // (b) Funding account: the merchant's account in the payout
+    // currency when one exists (no conversion, no quote). Otherwise
+    // the USD account, or the first account held, with an FX quote
+    // locked at execution time for the exact payout amount.
+    const accounts = m.nuvionAccounts ?? {};
+    let accountId = accounts[payoutCurrency];
+    let fxQuoteId: string | undefined;
+    if (!accountId) {
+      const fallbackCurrency = accounts.USD ? "USD" : Object.keys(accounts)[0];
+      if (!fallbackCurrency) throw new Error("the merchant has no Nuvion account to fund this payout");
+      accountId = accounts[fallbackCurrency];
+      const quote = await nuvionClient.createFxQuote({
+        from_currency: fallbackCurrency, to_currency: payoutCurrency,
+        amount_to: Number(fiatAmount), entity_id: m.nuvionEntityId,
+      });
+      fxQuoteId = quote.id;
+    }
+
+    // (c) The transfer. The payout id is minted first because it is
+    // the unique_reference: unique per entity forever, so a retry
+    // (a new payout with a new id) always carries a fresh reference.
+    const payoutId = makeId("pay");
+    const reference = row.reference ? String(row.reference).trim() : undefined;
+    const transfer = await nuvionClient.createTransfer({
+      account_id: accountId,
+      payment_detail_id: linked.nuvionPaymentDetailId,
+      counterparty_id: linked.nuvionCounterpartyId,
+      currency: payoutCurrency,
+      amount: Number(fiatAmount),
+      type: rec.kind === "bank" ? "bank-transfer" : "momo-transfer",
+      narration: reference ?? "",
+      unique_reference: payoutId,
+      ...(fxQuoteId ? { fx_quote_id: fxQuoteId } : {}),
+      entity_id: m.nuvionEntityId,
+      meta: { payout_id: payoutId },
+    });
+    const payout = store.createPayout({
+      id: payoutId, merchantId: m.id, batchId: opts.batchId, recipientAddress: row.recipientAddress,
+      destinationAsset: payoutCurrency, originAsset: opts.originAsset,
+      refundTo: row.refundTo ?? m.refundTo, amount: String(row.amount), status: "awaiting_funding",
+      idempotencyKey: opts.batchId ? undefined : opts.idem, retryOfId: opts.retryOf,
+      recipientId: rec.id, providerRef: transfer.id, fiatCurrency: payoutCurrency, fiatAmount,
+      reference, ...opts.breakdown,
+      createdAt: new Date().toISOString(),
+    });
+    store.addLedger({ merchantId: m.id, entityType: "payout", entityId: payout.id, kind: "payout_created", amount: payout.amount, asset: payoutCurrency });
+    // The initial status lands through the one transition path, so the
+    // payout.sent webhook and the transition ledger entry are written
+    // exactly as the poller writes them for later transitions.
+    applyPayoutTransition(store, payout, mapNuvionPayoutStatus(transfer.status));
+    return store.getPayout(m.id, payout.id) ?? payout;
+  };
+
   const createPayoutFor = async (m: Merchant, row: any, batchId?: string, idem?: string, retryOf?: string) => {
     const amount = String(row.amount);
     // The merchant funds a payout from the asset they settle in, unless the
     // row names its own origin. Defaulting to the destination asset made
     // same asset payouts unquotable on backends that refuse them.
     const originAsset = row.originAsset ?? m.settlementAsset;
+    const hasGross = row.grossAmount !== undefined && row.grossAmount !== null && row.grossAmount !== "";
+    const breakdown = {
+      grossAmount: hasGross ? String(row.grossAmount) : undefined,
+      retentionAmount: hasGross ? String(row.retentionAmount ?? "0") || "0" : undefined,
+      deductionsAmount: hasGross ? String(row.deductionsAmount ?? "0") || "0" : undefined,
+    };
+    // Nuvion bound rows (bank and mobile money recipients) execute
+    // through Nuvion and never touch the Intents quote path.
+    const rec = recipientForRow(m, row);
+    if (isNuvionBound(rec)) {
+      return executeNuvionPayoutFor(m, row, rec!, { batchId, idem, retryOf, originAsset, breakdown });
+    }
     const q = await intents.quote({
       dry: false, originAsset, destinationAsset: row.destinationAsset,
       amount, recipient: row.recipientAddress, refundTo: row.refundTo ?? m.refundTo,
       appFeeBps: cfg.appFeeBps, appFeeRecipient: cfg.appFeeRecipient,
     });
-    const hasGross = row.grossAmount !== undefined && row.grossAmount !== null && row.grossAmount !== "";
     const payout = store.createPayout({
       id: makeId("pay"), merchantId: m.id, batchId, recipientAddress: row.recipientAddress,
       destinationAsset: row.destinationAsset, originAsset,
@@ -1186,9 +1372,8 @@ export function buildApp(options: BuildOptions = {}) {
       depositAddress: q.quote.depositAddress, amountOut: q.quote.amountOut,
       idempotencyKey: batchId ? undefined : idem, retryOfId: retryOf, createdAt: new Date().toISOString(),
       reference: row.reference ? String(row.reference).trim() : undefined,
-      grossAmount: hasGross ? String(row.grossAmount) : undefined,
-      retentionAmount: hasGross ? String(row.retentionAmount ?? "0") || "0" : undefined,
-      deductionsAmount: hasGross ? String(row.deductionsAmount ?? "0") || "0" : undefined,
+      recipientId: row.recipientId ? String(row.recipientId) : undefined,
+      ...breakdown,
     });
     store.addLedger({ merchantId: m.id, entityType: "payout", entityId: payout.id, kind: "payout_quoted", amount, asset: row.destinationAsset });
     return payout;
@@ -1223,6 +1408,10 @@ export function buildApp(options: BuildOptions = {}) {
       originAsset: failed.originAsset, refundTo: failed.refundTo, amount: failed.amount,
       reference: failed.reference, grossAmount: failed.grossAmount,
       retentionAmount: failed.retentionAmount, deductionsAmount: failed.deductionsAmount,
+      // A Nuvion bound row retries through Nuvion: carrying the
+      // recipient id is what routes the fresh payout back to the rail,
+      // under its own new id and therefore a fresh unique_reference.
+      ...(failed.recipientId ? { recipientId: failed.recipientId } : {}),
     }, failed.batchId, undefined, failed.id);
     if (failed.batchId) {
       store.addLedger({ merchantId: m.id, entityType: "batch", entityId: failed.batchId, kind: "row_retried", amount: failed.amount, asset: failed.destinationAsset });
@@ -1232,8 +1421,10 @@ export function buildApp(options: BuildOptions = {}) {
     return payout;
   };
 
-  const validPayoutRow = (row: any): string | undefined => {
-    if (!row?.recipientAddress || !row?.destinationAsset) return "each payout needs recipientAddress and destinationAsset";
+  const validPayoutRow = (row: any, opts?: { nuvionBound?: boolean }): string | undefined => {
+    // A Nuvion bound row needs no destination asset: its recipient
+    // record carries the currency it pays in instead.
+    if (!row?.recipientAddress || (!opts?.nuvionBound && !row?.destinationAsset)) return "each payout needs recipientAddress and destinationAsset";
     if (!isAmountString(String(row.amount ?? ""))) return "each payout amount must be a positive integer string in smallest units";
     if (BigInt(String(row.amount)) > BigInt(cfg.pilotMaxPayoutUnits)) return "a payout amount exceeds the pilot cap";
     if (row.reference !== undefined && row.reference !== null && row.reference !== "") {
@@ -1274,7 +1465,8 @@ export function buildApp(options: BuildOptions = {}) {
     }
     const resolved = resolvePayoutRow(m, b);
     if (resolved.error) return reply.code(400).send({ error: resolved.error });
-    const problem = validPayoutRow(resolved.row);
+    const rec = recipientForRow(m, resolved.row);
+    const problem = validPayoutRow(resolved.row, { nuvionBound: isNuvionBound(rec) }) ?? nuvionRowProblem(m, resolved.row, rec);
     if (problem) return reply.code(400).send({ error: problem });
     try {
       const payout = await createPayoutFor(m, resolved.row, undefined, idem);
@@ -1365,7 +1557,8 @@ export function buildApp(options: BuildOptions = {}) {
     for (const row of rawRows ?? []) {
       const resolved = resolvePayoutRow(m, row);
       if (resolved.error) return reply.code(400).send({ error: resolved.error });
-      const problem = validPayoutRow(resolved.row);
+      const rec = recipientForRow(m, resolved.row);
+      const problem = validPayoutRow(resolved.row, { nuvionBound: isNuvionBound(rec) }) ?? nuvionRowProblem(m, resolved.row, rec);
       if (problem) return reply.code(400).send({ error: problem });
       resolvedRows.push(resolved.row);
     }
@@ -1499,7 +1692,8 @@ export function buildApp(options: BuildOptions = {}) {
     for (const row of rows) {
       const resolved = resolvePayoutRow(m, row);
       if (resolved.error) return { error: resolved.error };
-      const problem = validPayoutRow(resolved.row);
+      const rec = recipientForRow(m, resolved.row);
+      const problem = validPayoutRow(resolved.row, { nuvionBound: isNuvionBound(rec) }) ?? nuvionRowProblem(m, resolved.row, rec);
       if (problem) return { error: problem };
       out.push(resolved.row);
     }
@@ -1595,7 +1789,7 @@ export function buildApp(options: BuildOptions = {}) {
   });
 
   // Shared sync dependencies (the background loop in server.ts uses these).
-  (app as any).remiglo.syncDeps = { store, intents, fetchFn, webhookCfg: cfg.webhook, scheduleServices, indexer: indexerRun };
+  (app as any).remiglo.syncDeps = { store, intents, fetchFn, webhookCfg: cfg.webhook, scheduleServices, indexer: indexerRun, nuvion: nuvionClient };
 
   // ---- internal sync (poller trigger) ----
   app.post("/v1/internal/sync", async (req, reply) => {
