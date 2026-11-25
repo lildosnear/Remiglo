@@ -28,6 +28,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS merchants (
   id TEXT PRIMARY KEY, name TEXT NOT NULL,
   settlement_asset TEXT NOT NULL, settlement_address TEXT NOT NULL, refund_to TEXT NOT NULL,
+  nuvion_entity_id TEXT, nuvion_entity_status TEXT, nuvion_accounts TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -146,6 +147,15 @@ export class Store {
         this.db.exec(`ALTER TABLE payouts ADD COLUMN ${col} TEXT`);
       }
     }
+    // Migration for databases created before Nuvion merchant linking
+    // (fiat slice 2): the child entity id, its status, and a JSON map
+    // of currency code to Nuvion account id.
+    const merchantCols = this.db.prepare("PRAGMA table_info(merchants)").all() as Array<{ name: string }>;
+    for (const col of ["nuvion_entity_id", "nuvion_entity_status", "nuvion_accounts"]) {
+      if (!merchantCols.some((c) => c.name === col)) {
+        this.db.exec(`ALTER TABLE merchants ADD COLUMN ${col} TEXT`);
+      }
+    }
   }
 
   close() { this.db.close(); }
@@ -166,7 +176,8 @@ export class Store {
 
   merchantByApiKey(apiKey: string): Merchant | undefined {
     const row = this.db.prepare(
-      `SELECT m.id, m.name, m.settlement_asset, m.settlement_address, m.refund_to, m.created_at
+      `SELECT m.id, m.name, m.settlement_asset, m.settlement_address, m.refund_to, m.created_at,
+              m.nuvion_entity_id, m.nuvion_entity_status, m.nuvion_accounts
        FROM api_keys k JOIN merchants m ON m.id = k.merchant_id WHERE k.key_hash = ?`
     ).get(hashKey(apiKey)) as any;
     if (!row) return undefined;
@@ -189,6 +200,17 @@ export class Store {
     const next = { ...cur, ...patch };
     this.db.prepare("UPDATE merchants SET name=?, settlement_asset=?, settlement_address=?, refund_to=? WHERE id=?")
       .run(next.name, next.settlementAsset, next.settlementAddress, next.refundTo, id);
+    return next;
+  }
+
+  /** Nuvion link state only (fiat slice 2). The profile update above never touches these columns. */
+  updateMerchantNuvion(id: string, patch: Partial<Pick<Merchant, "nuvionEntityId" | "nuvionEntityStatus" | "nuvionAccounts">>): Merchant | undefined {
+    const cur = this.getMerchant(id);
+    if (!cur) return undefined;
+    const next = { ...cur, ...patch };
+    this.db.prepare("UPDATE merchants SET nuvion_entity_id=?, nuvion_entity_status=?, nuvion_accounts=? WHERE id=?")
+      .run(next.nuvionEntityId ?? null, next.nuvionEntityStatus ?? null,
+        next.nuvionAccounts ? JSON.stringify(next.nuvionAccounts) : null, id);
     return next;
   }
 
@@ -265,7 +287,12 @@ export class Store {
   }
 
   private rowMerchant(r: any): Merchant {
-    return { id: r.id, name: r.name, settlementAsset: r.settlement_asset, settlementAddress: r.settlement_address, refundTo: r.refund_to, createdAt: r.created_at };
+    return {
+      id: r.id, name: r.name, settlementAsset: r.settlement_asset, settlementAddress: r.settlement_address, refundTo: r.refund_to, createdAt: r.created_at,
+      nuvionEntityId: r.nuvion_entity_id ?? undefined,
+      nuvionEntityStatus: r.nuvion_entity_status ?? undefined,
+      nuvionAccounts: r.nuvion_accounts ? (JSON.parse(r.nuvion_accounts) as Record<string, string>) : undefined,
+    };
   }
 
   // ---- invoices ----

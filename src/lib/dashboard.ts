@@ -766,6 +766,22 @@ export function renderSettings(d: DashData, q: { notice?: string; error?: string
       <div class="field"><label for="refundTo">Refund address</label><input id="refundTo" name="refundTo" value="${esc(merchant.refundTo)}" required></div>
       <button class="btn" type="submit">Save profile</button></form>`
     : READ_ONLY_NOTE;
+  // Nuvion link state (fiat slice 2): read only for every role. Each
+  // business holds its own entity and accounts at Nuvion; Remiglo
+  // never holds merchant fiat.
+  const nuvionAccountRows: string[][] = Object.entries(merchant.nuvionAccounts ?? {})
+    .map(([currency, accountId]) => [`${esc(currency)} account`, `<span class="mono">${esc(accountId)}</span>`]);
+  const nuvionRows: string[][] = merchant.nuvionEntityId
+    ? [
+        ["Entity ID", `<span class="mono">${esc(merchant.nuvionEntityId)}</span>`],
+        ["Entity status", merchant.nuvionEntityStatus ? chip(merchant.nuvionEntityStatus) : esc("Unknown")],
+        ...(nuvionAccountRows.length > 0
+          ? nuvionAccountRows
+          : [["Accounts", esc("None yet. Accounts open once the entity is approved.")]]),
+      ]
+    : [["Status", esc("Not linked")]];
+  const nuvionCard = card("Nuvion fiat account", htable(["Field", "Value"], nuvionRows)
+    + `<p class="note">Fiat payouts run through Nuvion. This business holds its own entity and accounts there, in its own name; Remiglo runs the operations and never holds the money.</p>`);
   const users = store.listUsers(merchant.id);
   const roleOptions = (current: string) => ["owner", "admin", "operator", "viewer"]
     .map((r) => `<option value="${r}"${r === current ? " selected" : ""}>${r}</option>`).join("");
@@ -791,6 +807,7 @@ export function renderSettings(d: DashData, q: { notice?: string; error?: string
     : READ_ONLY_NOTE;
   const content = `
   ${card("Business profile", htable(["Field", "Value"], profileRows) + profileForm)}
+  ${nuvionCard}
   ${card("Team and permissions", htable(["Member", "Role", "State", "Added"], teamRows) + inviteForm)}`;
   return page(d, {
     active: "settings", title: "Settings", subtitle: `${merchant.name} · business profile, team and permissions`,

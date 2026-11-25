@@ -19,6 +19,7 @@ import { BUILTIN_ASSETS, builtinAsset, chainNameFor, guessAsset, parseDecimalToU
 import { renderPayNotFound, renderPayPage } from "./lib/paypage.js";
 import { parseBatchCsv } from "./lib/csv.js";
 import { getIntentsClient, MockIntents, type IntentsClient } from "./services/intents.js";
+import { getNuvionClient, MockNuvion, type NuvionClient } from "./services/nuvion.js";
 import { NearRegistry, type RegistryClient } from "./services/registry.js";
 import { indexOnce, indexerStatus } from "./services/indexer.js";
 import { NearRpc } from "./services/nearTx.js";
@@ -45,12 +46,17 @@ export interface AppConfig {
   nearRpcUrl?: string;
   registryNetwork?: string;
   nearArchivalRpcUrl?: string;
+  // Nuvion merchant linking (fiat slice 2): currencies that get an
+  // account opened for a merchant once its Nuvion entity is approved.
+  nuvionCurrencies: string[];
 }
 
 export interface BuildOptions {
   store?: Store;
   intents?: IntentsClient;
   mockIntents?: MockIntents;
+  nuvion?: NuvionClient;
+  mockNuvion?: MockNuvion;
   fetchFn?: FetchFn;
   registry?: RegistryClient;
   config?: Partial<AppConfig>;
@@ -71,6 +77,8 @@ export function resolveConfig(partial?: Partial<AppConfig>): AppConfig {
     nearRpcUrl: partial?.nearRpcUrl ?? process.env.NEAR_RPC_URL,
     registryNetwork: partial?.registryNetwork ?? process.env.REGISTRY_NETWORK,
     nearArchivalRpcUrl: partial?.nearArchivalRpcUrl ?? process.env.NEAR_ARCHIVAL_RPC_URL,
+    nuvionCurrencies: partial?.nuvionCurrencies
+      ?? (process.env.NUVION_CURRENCIES ?? "NGN,USD").split(",").map((c) => c.trim()).filter(Boolean),
   };
 }
 
@@ -82,6 +90,13 @@ export function buildApp(options: BuildOptions = {}) {
   const cfg = resolveConfig(options.config);
   const store = options.store ?? new Store(cfg.dbPath);
   const intents = options.intents ?? options.mockIntents ?? getIntentsClient();
+  // Nuvion (fiat slice 2): a client counts as available only when one is
+  // injected, a real key is configured, or NUVION_MOCK=1 asks for the
+  // mock. getNuvionClient on its own always returns the live client, so
+  // availability is decided here, not there. When unavailable, merchant
+  // linking is skipped and behaviour is exactly the pre Nuvion one.
+  const nuvionClient: NuvionClient | undefined = options.nuvion ?? options.mockNuvion
+    ?? (process.env.NUVION_API_KEY || process.env.NUVION_MOCK === "1" ? getNuvionClient() : undefined);
   const fetchFn = options.fetchFn ?? defaultFetch;
   const app = Fastify({ logger: false });
 
@@ -98,7 +113,7 @@ export function buildApp(options: BuildOptions = {}) {
     done(null, body as string);
   });
 
-  (app as any).remiglo = { store, intents, cfg, fetchFn };
+  (app as any).remiglo = { store, intents, cfg, fetchFn, nuvion: nuvionClient };
   app.addHook("onClose", async () => { try { store.close(); } catch { /* already closed */ } });
 
   // ---- registry anchoring (Slice G) ----
@@ -721,6 +736,34 @@ export function buildApp(options: BuildOptions = {}) {
   });
 
   // ---- merchants ----
+  // Nuvion linking (fiat slice 2): create the merchant's child entity
+  // (business kind) and store the link. Best effort by design, like
+  // registry anchoring: a Nuvion failure never blocks or fails merchant
+  // creation. The merchant is left with the "unlinked" status marker,
+  // and both outcomes land in the ledger.
+  const linkMerchantToNuvion = async (merchant: Merchant): Promise<Merchant> => {
+    if (!nuvionClient) return merchant;
+    try {
+      const entity = await nuvionClient.createEntity({ name: merchant.name }, "business");
+      const linked = store.updateMerchantNuvion(merchant.id, {
+        nuvionEntityId: entity.id, nuvionEntityStatus: entity.status,
+      });
+      store.addLedger({
+        merchantId: merchant.id, entityType: "merchant", entityId: merchant.id,
+        kind: "nuvion_entity_linked", amount: "0", asset: "",
+      });
+      return linked ?? merchant;
+    } catch (err) {
+      store.updateMerchantNuvion(merchant.id, { nuvionEntityStatus: "unlinked" });
+      store.addLedger({
+        merchantId: merchant.id, entityType: "merchant", entityId: merchant.id,
+        kind: "nuvion_link_failed", amount: "0", asset: "",
+      });
+      console.error(`nuvion link failed for merchant ${merchant.id}:`, err instanceof Error ? err.message : err);
+      return store.getMerchant(merchant.id) ?? merchant;
+    }
+  };
+
   app.post("/v1/merchants", async (req, reply) => {
     if (cfg.adminToken && !hasAdmin(req)) {
       return reply.code(401).send({ error: "merchant creation requires the admin token" });
@@ -729,19 +772,69 @@ export function buildApp(options: BuildOptions = {}) {
     if (!b?.name || !b?.settlementAsset || !b?.settlementAddress || !b?.refundTo) {
       return reply.code(400).send({ error: "name, settlementAsset, settlementAddress and refundTo are required" });
     }
-    const { merchant, apiKey } = store.createMerchant(b);
-    return reply.code(201).send({ merchant, apiKey, note: "Store this API key now. It is shown once and only its hash is kept." });
+    const created = store.createMerchant(b);
+    const merchant = await linkMerchantToNuvion(created.merchant);
+    return reply.code(201).send({ merchant, apiKey: created.apiKey, note: "Store this API key now. It is shown once and only its hash is kept." });
   });
 
   // Everything below /v1 (except internal sync, which has its own rule) needs a merchant key.
   app.addHook("preHandler", async (req, reply) => {
     if (!req.url.startsWith("/v1/")) return;
-    if (req.url.startsWith("/v1/merchants") && req.method === "POST") return;
+    // Only merchant creation itself is exempt; other POSTs under
+    // /v1/merchants (the Nuvion refresh) go through merchant auth.
+    if (req.method === "POST" && (req.url === "/v1/merchants" || req.url.startsWith("/v1/merchants?"))) return;
     if (req.url.startsWith("/v1/internal/")) return;
     await requireMerchant(req, reply);
   });
 
   app.get("/v1/merchants/me", async (req) => ({ merchant: req.merchant }));
+
+  // Nuvion status refresh (fiat slice 2): read the entity back, mirror
+  // its status, and when it is approved open one account per enabled
+  // currency that does not have one yet. Scoped like every other /v1
+  // route: the caller's own id only, anything else is a 404.
+  app.post("/v1/merchants/:id/nuvion/refresh", async (req, reply) => {
+    const m = req.merchant!;
+    if (m.id !== (req.params as any).id) return reply.code(404).send({ error: "merchant not found" });
+    if (!nuvionClient) return reply.code(409).send({ error: "Nuvion is not configured on this instance" });
+    if (!m.nuvionEntityId) return reply.code(409).send({ error: "merchant is not linked to a Nuvion entity" });
+    let entity;
+    try {
+      entity = await nuvionClient.getEntity(m.nuvionEntityId);
+    } catch (err) {
+      return reply.code(502).send({ error: `Nuvion entity read failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
+    let merchant = store.updateMerchantNuvion(m.id, { nuvionEntityStatus: entity.status }) ?? m;
+    if (entity.status === "approved") {
+      const accounts = { ...(merchant.nuvionAccounts ?? {}) };
+      let changed = false;
+      for (const currency of cfg.nuvionCurrencies) {
+        if (accounts[currency]) continue;
+        try {
+          const account = await nuvionClient.createAccount({ entity_id: m.nuvionEntityId, currency });
+          accounts[currency] = account.id;
+          changed = true;
+        } catch (err) {
+          // A failed account never fails the refresh; the currency
+          // stays absent so a later refresh retries it.
+          store.addLedger({
+            merchantId: m.id, entityType: "merchant", entityId: m.id,
+            kind: "nuvion_account_failed", amount: "0", asset: currency,
+          });
+          console.error(`nuvion account creation failed for merchant ${m.id} (${currency}):`, err instanceof Error ? err.message : err);
+        }
+      }
+      if (changed) merchant = store.updateMerchantNuvion(m.id, { nuvionAccounts: accounts }) ?? merchant;
+    }
+    return {
+      merchant,
+      nuvion: {
+        entityId: merchant.nuvionEntityId ?? null,
+        status: merchant.nuvionEntityStatus ?? null,
+        accounts: merchant.nuvionAccounts ?? {},
+      },
+    };
+  });
 
   app.get("/v1/tokens", async () => intents.tokens());
 

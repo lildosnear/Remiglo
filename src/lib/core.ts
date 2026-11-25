@@ -7,6 +7,12 @@ export interface Merchant {
   settlementAddress: string;
   refundTo: string;
   createdAt: string;
+  /** Nuvion child entity link (fiat slice 2). Absent until a link is attempted. */
+  nuvionEntityId?: string;
+  /** Nuvion entity status as last seen (pending, approved, ...), or "unlinked" after a failed link attempt. */
+  nuvionEntityStatus?: string;
+  /** Nuvion account id per currency code, opened once the entity is approved. */
+  nuvionAccounts?: Record<string, string>;
 }
 
 export interface Invoice {
@@ -158,7 +164,7 @@ export interface RegistryEvent {
 export interface LedgerEntry {
   id: string;
   merchantId?: string;
-  entityType: "invoice" | "payout" | "batch";
+  entityType: "invoice" | "payout" | "batch" | "merchant";
   entityId: string;
   kind: string;
   amount: string;
