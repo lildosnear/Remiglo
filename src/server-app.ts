@@ -1233,8 +1233,33 @@ export function buildApp(options: BuildOptions = {}) {
     return store.getRecipient(m.id, String(row.recipientId));
   };
 
-  /** A row is Nuvion bound when it resolves to a bank or mobile money recipient (fiat slice 4). */
-  const isNuvionBound = (rec?: Recipient): boolean => !!rec && (rec.kind === "bank" || rec.kind === "momo");
+  /** Nuvion's currency code for each stablecoin symbol it carries. */
+  const NUVION_STABLECOIN_CODES: Record<string, string> = { USDC: "USC", USDT: "UST", RLUSD: "RLD" };
+
+  /**
+   * The Nuvion currency code for a destination asset, sourced from the
+   * asset metadata the codebase already carries: the symbol recorded
+   * for the asset in BUILTIN_ASSETS, mapped to Nuvion's code for that
+   * symbol. Undefined when the asset is not a stablecoin Nuvion
+   * carries, or carries no recorded symbol.
+   */
+  const nuvionCodeForAsset = (assetId?: string): string | undefined => {
+    if (!assetId) return undefined;
+    const symbol = builtinAsset(assetId)?.symbol;
+    return symbol ? NUVION_STABLECOIN_CODES[symbol] : undefined;
+  };
+
+  /** A wallet recipient carrying one of the supported networks was created for the Nuvion rail (fiat slice 5). */
+  const isNuvionWallet = (rec?: Recipient): boolean => !!rec && rec.kind === "wallet" && !!rec.network;
+
+  /**
+   * A row is Nuvion bound when it resolves to a bank or mobile money
+   * recipient (fiat slice 4), or to a wallet recipient carrying a
+   * Nuvion network (fiat slice 5). A wallet recipient with no network
+   * recorded, and any raw address row, are legacy Intents rows.
+   */
+  const isNuvionBound = (rec?: Recipient): boolean =>
+    !!rec && (rec.kind === "bank" || rec.kind === "momo" || isNuvionWallet(rec));
 
   /**
    * Creation time refusals for a Nuvion bound row. Such a row can only
@@ -1245,6 +1270,25 @@ export function buildApp(options: BuildOptions = {}) {
    */
   const nuvionRowProblem = (m: Merchant, row: any, rec?: Recipient): string | undefined => {
     if (!isNuvionBound(rec)) return undefined;
+    if (isNuvionWallet(rec)) {
+      // What a network carrying wallet can be paid in is a property of
+      // the row itself, so those refusals come before the rail's
+      // availability: the recipient was created for the Nuvion rail,
+      // and no other rail may pick the row up instead.
+      const code = nuvionCodeForAsset(row?.destinationAsset ?? rec!.assetId);
+      if (!code) return "this wallet recipient is set up for a Nuvion stablecoin transfer, but the destination asset is not a stablecoin Nuvion carries (USDC, USDT or RLUSD)";
+      if (code === "RLD" && rec!.network !== "ETH_MAINNET") {
+        return "RLUSD is only available on Ethereum through Nuvion, and this recipient's network is not ETH_MAINNET";
+      }
+      if (!nuvionClient) return "this recipient is paid by stablecoin transfer, but Nuvion is not configured on this instance";
+      if (!m.nuvionEntityId) return "this recipient is paid by stablecoin transfer, but the merchant is not linked to a Nuvion entity";
+      try {
+        chainUnitsToNuvionUnits(String(row.amount ?? ""));
+      } catch {
+        return "a stablecoin payout amount must be exact to the cent (two decimal places)";
+      }
+      return undefined;
+    }
     if (!nuvionClient) return "this recipient is paid in fiat, but Nuvion is not configured on this instance";
     if (!m.nuvionEntityId) return "this recipient is paid in fiat, but the merchant is not linked to a Nuvion entity";
     if (!rec!.currency) return "the recipient has no payout currency recorded";
@@ -1258,21 +1302,44 @@ export function buildApp(options: BuildOptions = {}) {
 
   // ---- payouts ----
   /**
-   * Execute one Nuvion bound payout (fiat slice 4, Flow A). Mirrors the
-   * Intents quote step's place in the flow: the external call happens
-   * first and the payout record is created only once the transfer
-   * exists, so an execution failure leaves no record, exactly like a
-   * quote failure. Any throw is the execution failure the batch
-   * semantics in createBatchFor and approveBatchFor already handle.
+   * Execute one Nuvion bound payout (fiat slice 4, Flow A; stablecoin
+   * rows joined in slice 5, Flow B). Mirrors the Intents quote step's
+   * place in the flow: the external call happens first and the payout
+   * record is created only once the transfer exists, so an execution
+   * failure leaves no record, exactly like a quote failure. Any throw
+   * is the execution failure the batch semantics in createBatchFor and
+   * approveBatchFor already handle.
+   *
+   * The payout currency is the denomination the Nuvion transfer moves
+   * in: the recipient's currency for bank and mobile money rows, and
+   * the destination asset's Nuvion stablecoin code (USC, UST or RLD)
+   * for wallet rows. The payout record keeps the row's destination
+   * asset, which for a stablecoin row is the asset id itself.
    */
   const executeNuvionPayoutFor = async (
     m: Merchant, row: any, rec: Recipient,
     opts: { batchId?: string; idem?: string; retryOf?: string; originAsset: string; breakdown: Record<string, string | undefined> },
   ) => {
-    if (!nuvionClient) throw new Error("this recipient is paid in fiat, but Nuvion is not configured on this instance");
-    if (!m.nuvionEntityId) throw new Error("this recipient is paid in fiat, but the merchant is not linked to a Nuvion entity");
-    const payoutCurrency = rec.currency;
-    if (!payoutCurrency) throw new Error("the recipient has no payout currency recorded");
+    const stable = rec.kind === "wallet";
+    if (!nuvionClient) throw new Error(stable
+      ? "this recipient is paid by stablecoin transfer, but Nuvion is not configured on this instance"
+      : "this recipient is paid in fiat, but Nuvion is not configured on this instance");
+    if (!m.nuvionEntityId) throw new Error(stable
+      ? "this recipient is paid by stablecoin transfer, but the merchant is not linked to a Nuvion entity"
+      : "this recipient is paid in fiat, but the merchant is not linked to a Nuvion entity");
+    // Backstops for the creation time refusals in nuvionRowProblem,
+    // for paths that reach execution directly (schedule runs, retries).
+    let payoutCurrency: string | undefined;
+    if (stable) {
+      payoutCurrency = nuvionCodeForAsset(row.destinationAsset ?? rec.assetId);
+      if (!payoutCurrency) throw new Error("the destination asset is not a stablecoin Nuvion carries (USDC, USDT or RLUSD)");
+      if (payoutCurrency === "RLD" && rec.network !== "ETH_MAINNET") {
+        throw new Error("RLUSD is only available on Ethereum through Nuvion, and this recipient's network is not ETH_MAINNET");
+      }
+    } else {
+      payoutCurrency = rec.currency;
+      if (!payoutCurrency) throw new Error("the recipient has no payout currency recorded");
+    }
     // Throws when the amount is not exact to the cent; creation routes
     // refuse such rows up front, so this is the backstop for paths that
     // reach execution directly (schedule runs, retries).
@@ -1290,9 +1357,10 @@ export function buildApp(options: BuildOptions = {}) {
     }
 
     // (b) Funding account: the merchant's account in the payout
-    // currency when one exists (no conversion, no quote). Otherwise
-    // the USD account, or the first account held, with an FX quote
-    // locked at execution time for the exact payout amount.
+    // currency when one exists (no conversion, no quote) — for a
+    // stablecoin row that is the account in the row's stablecoin code.
+    // Otherwise the USD account, or the first account held, with an FX
+    // quote locked at execution time for the exact payout amount.
     const accounts = m.nuvionAccounts ?? {};
     let accountId = accounts[payoutCurrency];
     let fxQuoteId: string | undefined;
@@ -1318,7 +1386,7 @@ export function buildApp(options: BuildOptions = {}) {
       counterparty_id: linked.nuvionCounterpartyId,
       currency: payoutCurrency,
       amount: Number(fiatAmount),
-      type: rec.kind === "bank" ? "bank-transfer" : "momo-transfer",
+      type: rec.kind === "bank" ? "bank-transfer" : rec.kind === "momo" ? "momo-transfer" : "stablecoin-transfer",
       narration: reference ?? "",
       unique_reference: payoutId,
       ...(fxQuoteId ? { fx_quote_id: fxQuoteId } : {}),
@@ -1327,14 +1395,14 @@ export function buildApp(options: BuildOptions = {}) {
     });
     const payout = store.createPayout({
       id: payoutId, merchantId: m.id, batchId: opts.batchId, recipientAddress: row.recipientAddress,
-      destinationAsset: payoutCurrency, originAsset: opts.originAsset,
+      destinationAsset: stable ? (row.destinationAsset ?? rec.assetId) : payoutCurrency, originAsset: opts.originAsset,
       refundTo: row.refundTo ?? m.refundTo, amount: String(row.amount), status: "awaiting_funding",
       idempotencyKey: opts.batchId ? undefined : opts.idem, retryOfId: opts.retryOf,
       recipientId: rec.id, providerRef: transfer.id, fiatCurrency: payoutCurrency, fiatAmount,
       reference, ...opts.breakdown,
       createdAt: new Date().toISOString(),
     });
-    store.addLedger({ merchantId: m.id, entityType: "payout", entityId: payout.id, kind: "payout_created", amount: payout.amount, asset: payoutCurrency });
+    store.addLedger({ merchantId: m.id, entityType: "payout", entityId: payout.id, kind: "payout_created", amount: payout.amount, asset: payout.destinationAsset });
     // The initial status lands through the one transition path, so the
     // payout.sent webhook and the transition ledger entry are written
     // exactly as the poller writes them for later transitions.
@@ -1354,8 +1422,9 @@ export function buildApp(options: BuildOptions = {}) {
       retentionAmount: hasGross ? String(row.retentionAmount ?? "0") || "0" : undefined,
       deductionsAmount: hasGross ? String(row.deductionsAmount ?? "0") || "0" : undefined,
     };
-    // Nuvion bound rows (bank and mobile money recipients) execute
-    // through Nuvion and never touch the Intents quote path.
+    // Nuvion bound rows (bank and mobile money recipients, and wallet
+    // recipients carrying a Nuvion network) execute through Nuvion
+    // and never touch the Intents quote path.
     const rec = recipientForRow(m, row);
     if (isNuvionBound(rec)) {
       return executeNuvionPayoutFor(m, row, rec!, { batchId, idem, retryOf, originAsset, breakdown });
@@ -1499,11 +1568,27 @@ export function buildApp(options: BuildOptions = {}) {
 
   // ---- payout batches ----
   /**
+   * Mark an attempt's payouts failed after a batch creation or
+   * approval attempt failed partway. A payout that already carries a
+   * provider_ref holds a live Nuvion transfer that may still settle;
+   * failing it locally would make the poller stop watching it, so it
+   * keeps its live status and the backstop keeps tracking it (the
+   * slice 5 sharp edge fix). A payout without one only ever held a
+   * quote, and fails with the attempt exactly as before.
+   */
+  const failAttemptPayouts = (payouts: Payout[]) => {
+    for (const p of payouts) {
+      if (!p.providerRef) store.updatePayout(p.id, { status: "failed" });
+    }
+  };
+
+  /**
    * The one batch creation path. Rows must already be resolved and
    * validated. Over threshold batches wait in pending_approval with no
    * payouts created; under threshold batches quote every row at once.
    * A quote failure fails the whole batch: the batch is marked failed,
-   * and any rows already quoted are marked failed with it. Their deposit
+   * and any rows already quoted are marked failed with it (see
+   * failAttemptPayouts for the one exception). Their deposit
    * addresses were never returned in a success response, so nothing can
    * be funded against them.
    */
@@ -1526,7 +1611,7 @@ export function buildApp(options: BuildOptions = {}) {
         for (const row of rows) payouts.push(await createPayoutFor(m, row, batch.id));
       } catch (err) {
         quoteError = err instanceof Error ? err.message : String(err);
-        for (const p of payouts) store.updatePayout(p.id, { status: "failed" });
+        failAttemptPayouts(payouts);
         store.updateBatch(batch.id, { status: "failed" });
         store.addLedger({ merchantId: m.id, entityType: "batch", entityId: batch.id, kind: "batch_failed", amount: total.toString(), asset: String(rows[0].destinationAsset ?? "") });
         return { batch: store.getBatch(m.id, batch.id) ?? batch, payouts, quoteError };
@@ -1581,14 +1666,38 @@ export function buildApp(options: BuildOptions = {}) {
   /** The one batch approval path: quote every row, mark active, ledger. API and dashboard both call this. */
   const approveBatchFor = async (m: Merchant, batch: PayoutBatch) => {
     const payouts: Payout[] = [];
+    // Re approval after a part failed attempt: a row that already
+    // executed through Nuvion carries a provider_ref and a live
+    // transfer at the rail. It must never be executed a second time,
+    // so the payouts a previous attempt created are matched back to
+    // their rows, in order, and reused as they stand. Retry payouts
+    // are excluded: they belong to the retry path, not to an approval
+    // attempt. Only rows with no transfer yet execute here.
+    const inFlight = store.payoutsByBatch(batch.id).filter((p) => p.providerRef && !p.retryOfId);
+    let inFlightIdx = 0;
+    const reuseFor = (row: any): Payout | undefined => {
+      const candidate = inFlight[inFlightIdx];
+      if (!candidate) return undefined;
+      const matches = candidate.recipientAddress === row.recipientAddress
+        && candidate.destinationAsset === row.destinationAsset
+        && candidate.amount === String(row.amount)
+        && (candidate.recipientId ?? undefined) === (row.recipientId ? String(row.recipientId) : undefined);
+      if (!matches) return undefined;
+      inFlightIdx += 1;
+      return candidate;
+    };
     try {
-      for (const row of batch.rows) payouts.push(await createPayoutFor(m, row, batch.id));
+      for (const row of batch.rows) payouts.push(reuseFor(row) ?? await createPayoutFor(m, row, batch.id));
     } catch (err) {
-      // Approval stays retryable: fail only the rows this attempt quoted
-      // (their deposit addresses were never returned), keep the batch in
-      // pending_approval, and let the caller report the quote failure. A
-      // later approval creates fresh payouts, so no row can be paid twice.
-      for (const p of payouts) store.updatePayout(p.id, { status: "failed" });
+      // Approval stays retryable: fail only the rows this attempt
+      // quoted (their deposit addresses were never returned), keep the
+      // batch in pending_approval, and let the caller report the quote
+      // failure. A later approval creates fresh payouts for those
+      // rows, so no row can be paid twice. Rows already carrying a
+      // provider_ref are the exception (see failAttemptPayouts): their
+      // transfers are live, they keep their status, and a later
+      // approval reuses them instead of executing them again.
+      failAttemptPayouts(payouts);
       throw err;
     }
     const updated = store.updateBatch(batch.id, { status: "active" })!;

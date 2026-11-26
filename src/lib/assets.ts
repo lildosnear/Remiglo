@@ -58,6 +58,10 @@ export const BUILTIN_ASSETS: Record<string, RawAsset> = {
   // Ethereum
   "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near": { symbol: "USDC", decimals: 6, blockchain: "eth" },
   "nep141:eth-0xdac17f958d2ee523a2206206994597c13d831ec7.omft.near": { symbol: "USDT", decimals: 6, blockchain: "eth" },
+  // RLUSD on Ethereum, added for the Nuvion rail (fiat slice 5): the
+  // canonical RLUSD contract under the same omni bridge pattern as the
+  // entries above. Not part of the 2026-11-06 verification pass.
+  "nep141:eth-0x8292bb45bf1ee4d140127049757c2e0ff06317ed.omft.near": { symbol: "RLUSD", decimals: 6, blockchain: "eth" },
   // Arbitrum
   "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near": { symbol: "USDC", decimals: 6, blockchain: "arb" },
   // Solana
