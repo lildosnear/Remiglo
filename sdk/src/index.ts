@@ -51,6 +51,10 @@ export interface Payout {
   retryOfId?: string;
   reference?: string;
   grossAmount?: string; retentionAmount?: string; deductionsAmount?: string;
+  /** Nuvion bound rows: the transfer id at Nuvion, and the row's fiat denomination. */
+  providerRef?: string; fiatCurrency?: string; fiatAmount?: string;
+  /** Nuvion bound rows: the FX quote that funded the transfer, and the fee Nuvion reported for it. */
+  fxQuoteId?: string; providerFee?: string;
 }
 
 export interface PayoutRow {

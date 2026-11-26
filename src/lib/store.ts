@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS payouts (
   amount_out TEXT, idempotency_key TEXT, retry_of TEXT, reference TEXT,
   gross_amount TEXT, retention_amount TEXT, deductions_amount TEXT,
   recipient_id TEXT, provider_ref TEXT, fiat_currency TEXT, fiat_amount TEXT,
+  fx_quote_id TEXT, provider_fee TEXT,
   created_at TEXT NOT NULL, updated_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payout_idem ON payouts(merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -160,6 +161,14 @@ export class Store {
     // (fiat slice 4): the recipient the row came from, and the Nuvion
     // transfer reference plus the fiat denomination of the row.
     for (const col of ["recipient_id", "provider_ref", "fiat_currency", "fiat_amount"]) {
+      if (!payoutCols.some((c) => c.name === col)) {
+        this.db.exec(`ALTER TABLE payouts ADD COLUMN ${col} TEXT`);
+      }
+    }
+    // Migration for databases created before Nuvion reconciliation
+    // (fiat slice 6): the FX quote that funded the row, and the fee
+    // Nuvion reported for the transfer.
+    for (const col of ["fx_quote_id", "provider_fee"]) {
       if (!payoutCols.some((c) => c.name === col)) {
         this.db.exec(`ALTER TABLE payouts ADD COLUMN ${col} TEXT`);
       }
@@ -380,13 +389,14 @@ export class Store {
 
   // ---- payouts and batches ----
   createPayout(p: Payout) {
-    this.db.prepare(`INSERT INTO payouts (id,merchant_id,batch_id,recipient_address,destination_asset,origin_asset,refund_to,amount,status,deposit_address,amount_out,idempotency_key,retry_of,reference,gross_amount,retention_amount,deductions_amount,recipient_id,provider_ref,fiat_currency,fiat_amount,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    this.db.prepare(`INSERT INTO payouts (id,merchant_id,batch_id,recipient_address,destination_asset,origin_asset,refund_to,amount,status,deposit_address,amount_out,idempotency_key,retry_of,reference,gross_amount,retention_amount,deductions_amount,recipient_id,provider_ref,fiat_currency,fiat_amount,fx_quote_id,provider_fee,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(p.id, p.merchantId, p.batchId ?? null, p.recipientAddress, p.destinationAsset, p.originAsset,
         p.refundTo ?? null, p.amount, p.status, p.depositAddress ?? null, p.amountOut ?? null,
         p.idempotencyKey ?? null, p.retryOfId ?? null, p.reference ?? null,
         p.grossAmount ?? null, p.retentionAmount ?? null, p.deductionsAmount ?? null,
         p.recipientId ?? null, p.providerRef ?? null, p.fiatCurrency ?? null, p.fiatAmount ?? null,
+        p.fxQuoteId ?? null, p.providerFee ?? null,
         p.createdAt, p.createdAt);
     return p;
   }
@@ -433,9 +443,10 @@ export class Store {
     const cur = this.db.prepare("SELECT * FROM payouts WHERE id = ?").get(id) as any;
     if (!cur) return undefined;
     const next = { ...this.rowPayout(cur), ...patch, updatedAt: now() };
-    this.db.prepare(`UPDATE payouts SET status=?, deposit_address=?, amount_out=?, provider_ref=?, fiat_currency=?, fiat_amount=?, updated_at=? WHERE id=?`)
+    this.db.prepare(`UPDATE payouts SET status=?, deposit_address=?, amount_out=?, provider_ref=?, fiat_currency=?, fiat_amount=?, fx_quote_id=?, provider_fee=?, updated_at=? WHERE id=?`)
       .run(next.status, next.depositAddress ?? null, next.amountOut ?? null, next.providerRef ?? null,
-        next.fiatCurrency ?? null, next.fiatAmount ?? null, next.updatedAt, id);
+        next.fiatCurrency ?? null, next.fiatAmount ?? null, next.fxQuoteId ?? null, next.providerFee ?? null,
+        next.updatedAt, id);
     return next;
   }
 
@@ -450,6 +461,7 @@ export class Store {
       deductionsAmount: r.deductions_amount ?? undefined,
       recipientId: r.recipient_id ?? undefined, providerRef: r.provider_ref ?? undefined,
       fiatCurrency: r.fiat_currency ?? undefined, fiatAmount: r.fiat_amount ?? undefined,
+      fxQuoteId: r.fx_quote_id ?? undefined, providerFee: r.provider_fee ?? undefined,
       createdAt: r.created_at, updatedAt: r.updated_at ?? undefined,
     };
   }

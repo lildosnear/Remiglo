@@ -511,7 +511,7 @@ describe("payout references and breakdown", () => {
     const res = await h.app.inject({ method: "GET", url: "/v1/reconciliation/payouts.csv", headers: auth });
     expect(res.statusCode).toBe(200);
     const lines = res.body.trim().split("\n");
-    expect(lines[0]).toBe("payout_id,batch_id,recipient_address,reference,gross_amount,retention_amount,deductions_amount,net_amount,amount_received,destination_asset,status,deposit_address,created_at");
+    expect(lines[0]).toBe("payout_id,batch_id,recipient_address,reference,gross_amount,retention_amount,deductions_amount,net_amount,amount_received,destination_asset,status,deposit_address,created_at,rail,fiat_currency,fiat_amount,fx_quote_id,provider_ref,provider_fee");
     expect(lines[1]).toContain("INV-2041");
     expect(lines[1]).toContain("100000000,10000000,5000000,85000000");
     const badBatch = await h.app.inject({ method: "POST", url: "/v1/payout-batches", headers: auth, payload: { rows: [{ recipientAddress: "ada.near", destinationAsset: USDC_NEAR, amount: "80000000", ...BREAKDOWN }] } });

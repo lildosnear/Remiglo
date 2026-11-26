@@ -1,7 +1,7 @@
 import { reconcile, PAYOUT_TERMINAL, type Payout } from "../lib/core.js";
 import type { Store } from "../lib/store.js";
 import { mapPayoutStatus, mapStatus, type IntentsClient } from "./intents.js";
-import { mapNuvionPayoutStatus, type NuvionClient } from "./nuvion.js";
+import { mapNuvionPayoutStatus, type NuvionClient, type NuvionTransfer } from "./nuvion.js";
 import { enqueueEvent, processPendingDeliveries, type FetchFn, type WebhookConfig } from "./webhooks.js";
 import { runDueSchedules, type ScheduleRunResult, type ScheduleServices } from "./schedules.js";
 import type { IndexerRunResult } from "./indexer.js";
@@ -113,6 +113,21 @@ export function completeBatchIfDone(store: Store, batchId: string): boolean {
 export const NUVION_OUTFLOW_EVENTS = ["outflows.created", "outflows.completed", "outflows.failed", "outflows.cancelled"];
 
 /**
+ * Record the fee Nuvion reports for a transfer (fiat slice 6). Called
+ * on every sync loop read of a transfer object, in both the webhook
+ * drain and the polling pass, independently of whether the read also
+ * moves the payout's status. The fee is kept verbatim, in the units
+ * Nuvion reports it (its own smallest units for the transfer's
+ * currency, the same units as the transfer amount), as a string to
+ * match the payout record's other amount fields.
+ */
+export function captureProviderFee(store: Store, pay: Payout, t: NuvionTransfer): void {
+  if (t.fee === undefined) return;
+  const fee = String(t.fee);
+  if (fee !== pay.providerFee) store.updatePayout(pay.id, { providerFee: fee });
+}
+
+/**
  * One sync cycle. Polls every open invoice and funded payout, applies at
  * most one transition per entity, writes a ledger entry per transition and
  * enqueues a webhook per transition. Per entity errors are caught and left
@@ -203,6 +218,7 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncResult> {
           const pay = store.payoutByProviderRef(ev.transferId);
           if (pay && !PAYOUT_TERMINAL.includes(pay.status)) {
             const t = await nuvion.getTransfer(ev.transferId);
+            captureProviderFee(store, pay, t);
             const changed = applyPayoutTransition(store, pay, mapNuvionPayoutStatus(t.status));
             if (changed) {
               if (pay.batchId) touchedBatches.add(pay.batchId);
@@ -223,6 +239,7 @@ export async function syncOnce(deps: SyncDeps): Promise<SyncResult> {
       result.nuvionPayoutsChecked += 1;
       try {
         const t = await nuvion.getTransfer(pay.providerRef!);
+        captureProviderFee(store, pay, t);
         const changed = applyPayoutTransition(store, pay, mapNuvionPayoutStatus(t.status));
         if (!changed) continue;
         if (pay.batchId) touchedBatches.add(pay.batchId);

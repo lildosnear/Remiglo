@@ -570,16 +570,29 @@ export function renderRouting(d: DashData, tokens: RoutingToken[]): string {
   const activity = [...byDest.entries()].sort((a, b) => Number(b[1].usd - a[1].usd)).map(([label, v]) => ({
     label: `${label} (${v.count})`, units: v.usd, display: fmtUsd(v.usd),
   }));
-  const registryEvents = store.listRegistryEvents(undefined, 10);
-  const registryCard = card("Registry activity", registryEvents.length === 0
-    ? `<p class="empty">No registry events indexed yet. When the registry contract is configured, its on chain audit events (merchant registered, policy updated, batch recorded, payout anchored) appear here, indexed from NEAR RPC.</p>`
-    : htable(["When", "Event", "Merchant", "Block", "Transaction"], registryEvents.map((e) => [
-        fmtDate(e.indexedAt), chip(e.event), esc(String(e.data.merchant ?? "—")),
-        String(e.blockHeight), `<span class="mono">${esc(short(e.txHash, 18))}</span>`,
+  // Nuvion activity (fiat slice 6): the transfers this merchant's
+  // payouts made at Nuvion, and the state of its account there. The
+  // registry activity section that used to sit in this slot retired
+  // with the registry contract; its events no longer belong here.
+  const nuvionPayouts = payouts.filter((p) => p.providerRef).slice(-10).reverse();
+  const nuvionTransfersCard = card("Nuvion transfers", nuvionPayouts.length === 0
+    ? `<p class="empty">No Nuvion transfers yet. Payouts to bank, mobile money and supported network wallet recipients settle through Nuvion and appear here with their transfer reference.</p>`
+    : htable(["Transfer", "Status", "Currency", "Amount", "Fee"], nuvionPayouts.map((p) => [
+        `<span class="mono">${esc(short(p.providerRef!, 22))}</span>`, chip(p.status),
+        esc(p.fiatCurrency ?? "—"), p.fiatAmount ? esc(formatUnits(p.fiatAmount, 2)) : "—",
+        p.providerFee ? esc(formatUnits(p.providerFee, 2)) : "—",
       ])));
+  const nuvionCurrencyRows: string[][] = Object.entries(merchant.nuvionAccounts ?? {})
+    .map(([currency, accountId]) => [`${esc(currency)} account`, `<span class="mono">${esc(accountId)}</span>`]);
+  const nuvionAccountRows: string[][] = merchant.nuvionEntityId
+    ? [["Entity status", merchant.nuvionEntityStatus ? chip(merchant.nuvionEntityStatus) : esc("Unknown")], ...nuvionCurrencyRows]
+    : [["Status", esc("Not linked")]];
+  const nuvionAccountCard = card("Nuvion account", htable(["Field", "Value"], nuvionAccountRows)
+    + `<p class="note">This business holds its own entity and accounts at Nuvion, in its own name; Remiglo runs the operations and never holds the money.</p>`);
   const content = `
   ${card("Routing activity", `<p class="note">Payouts by destination network, all time.</p>` + hBarSvg(activity))}
-  ${registryCard}
+  ${nuvionTransfersCard}
+  ${nuvionAccountCard}
   <h2 style="font-size:15px;margin:18px 0 10px">Supported networks and assets</h2>
   ${supported || card("Supported networks and assets", `<p class="empty">No token list available right now.</p>`)}`;
   return page(d, {
@@ -604,13 +617,20 @@ export function renderReconciliation(d: DashData): string {
     const clean = i.status === "paid" && (i.reconFlag === "matched" || !i.reconFlag);
     if (INVOICE_TERMINAL.includes(i.status) && !clean) {
       exceptions.push(["Invoice", `<span class="mono">${esc(short(i.id))}</span>`, chip(i.status),
-        esc(i.reconFlag ?? i.status), esc(formatAmount(i.amount, info(i.originAsset ?? i.settlementAsset))), fmtDate(i.updatedAt ?? i.createdAt)]);
+        esc(i.reconFlag ?? i.status), esc(formatAmount(i.amount, info(i.originAsset ?? i.settlementAsset))),
+        "—", "—", fmtDate(i.updatedAt ?? i.createdAt)]);
     }
   }
   for (const p of payouts) {
     if (PAYOUT_TERMINAL.includes(p.status) && p.status !== "settled") {
+      // Rail and provider reference (fiat slice 6): the same join keys
+      // the payout reconciliation export carries, so a row on this
+      // page can be matched against the provider's own record.
       exceptions.push(["Payout", `<span class="mono">${esc(short(p.id))}</span>`, chip(p.status),
-        esc(p.status), esc(formatAmount(p.amount, info(p.originAsset))), fmtDate(p.updatedAt ?? p.createdAt)]);
+        esc(p.status), esc(formatAmount(p.amount, info(p.originAsset))),
+        esc(p.providerRef ? "nuvion" : "intents"),
+        p.providerRef ? `<span class="mono">${esc(short(p.providerRef, 22))}</span>` : "—",
+        fmtDate(p.updatedAt ?? p.createdAt)]);
     }
   }
   const content = `
@@ -621,10 +641,10 @@ export function renderReconciliation(d: DashData): string {
     ${statCard("Failed or refunded", String(failedRefunded), "Across invoices and payouts")}
   </div>
   ${card("Exceptions", `<p class="note">Finished payments that did not settle cleanly. In flight payments are on the Payments page, not here.</p>` +
-    htable(["Type", "ID", "Status", "Reason", "Amount", "Updated"], exceptions))}
+    htable(["Type", "ID", "Status", "Reason", "Amount", "Rail", "Provider reference", "Updated"], exceptions))}
   ${card("Export", `<p>Full per invoice reconciliation with gross, fee estimate and net is available from the API export endpoint. It needs your merchant API key, so call it from your backend or with curl:</p>
     <p><a href="/v1/reconciliation/export.csv">GET /v1/reconciliation/export.csv</a></p>
-    <p>Per payout reconciliation carries each payment reference with its gross, retention, deductions and net, ready to match against approved invoices at month end:</p>
+    <p>Per payout reconciliation carries each payment reference with its gross, retention, deductions and net, plus the rail each row settled on and its provider reference, ready to match against approved invoices at month end:</p>
     <p><a href="/v1/reconciliation/payouts.csv">GET /v1/reconciliation/payouts.csv</a></p>`)}`;
   return page(d, {
     active: "reconciliation", title: "Reconciliation", subtitle: `${merchant.name} · matched, unmatched and failed transactions`,

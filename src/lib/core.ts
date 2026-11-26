@@ -78,6 +78,10 @@ export interface Payout {
   fiatCurrency?: string;
   /** Nuvion bound rows: the amount in Nuvion's 2 decimal smallest units, as a string. */
   fiatAmount?: string;
+  /** Nuvion bound rows: the FX quote that funded the transfer, when the funding account's currency differed (fiat slice 6). */
+  fxQuoteId?: string;
+  /** Nuvion bound rows: the fee Nuvion reported for the transfer, in Nuvion's smallest units for the payout currency, as reported (fiat slice 6). */
+  providerFee?: string;
   createdAt: string;
   updatedAt?: string;
 }

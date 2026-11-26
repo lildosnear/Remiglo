@@ -1399,6 +1399,7 @@ export function buildApp(options: BuildOptions = {}) {
       refundTo: row.refundTo ?? m.refundTo, amount: String(row.amount), status: "awaiting_funding",
       idempotencyKey: opts.batchId ? undefined : opts.idem, retryOfId: opts.retryOf,
       recipientId: rec.id, providerRef: transfer.id, fiatCurrency: payoutCurrency, fiatAmount,
+      fxQuoteId,
       reference, ...opts.breakdown,
       createdAt: new Date().toISOString(),
     });
@@ -1755,10 +1756,14 @@ export function buildApp(options: BuildOptions = {}) {
 
   app.get("/v1/reconciliation/payouts.csv", async (req, reply) => {
     const m = req.merchant!;
-    const head = "payout_id,batch_id,recipient_address,reference,gross_amount,retention_amount,deductions_amount,net_amount,amount_received,destination_asset,status,deposit_address,created_at";
+    const head = "payout_id,batch_id,recipient_address,reference,gross_amount,retention_amount,deductions_amount,net_amount,amount_received,destination_asset,status,deposit_address,created_at,rail,fiat_currency,fiat_amount,fx_quote_id,provider_ref,provider_fee";
     const esc = (c: string) => (/[",\n]/.test(c) ? `"${c.replace(/"/g, '""')}"` : c);
     const lines = store.listPayouts(m.id).map((p) => {
-      const cells = [p.id, p.batchId ?? "", p.recipientAddress, p.reference ?? "", p.grossAmount ?? "", p.retentionAmount ?? "", p.deductionsAmount ?? "", p.amount, p.amountOut ?? "", p.destinationAsset, p.status, p.depositAddress ?? "", p.createdAt];
+      // Trailing Nuvion columns (fiat slice 6): the rail a row settled
+      // on and its provider side record, empty for rows that have none.
+      // Existing columns and their order are untouched.
+      const cells = [p.id, p.batchId ?? "", p.recipientAddress, p.reference ?? "", p.grossAmount ?? "", p.retentionAmount ?? "", p.deductionsAmount ?? "", p.amount, p.amountOut ?? "", p.destinationAsset, p.status, p.depositAddress ?? "", p.createdAt,
+        p.providerRef ? "nuvion" : "intents", p.fiatCurrency ?? "", p.fiatAmount ?? "", p.fxQuoteId ?? "", p.providerRef ?? "", p.providerFee ?? ""];
       return cells.map(esc).join(",");
     });
     reply.type("text/csv").header("content-disposition", "attachment; filename=remiglo-payouts.csv")
