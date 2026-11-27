@@ -790,6 +790,11 @@ export function renderDevelopers(d: DashData): string {
 // ---------------------------------------------------------------- Settings
 export function renderSettings(d: DashData, q: { notice?: string; error?: string } = {}): string {
   const { store, merchant } = d;
+  // A merchant created name only (the Nuvion sign up) has no legacy
+  // settlement fields; the page must not present empty ones as if
+  // they meant something, so the settlement rows and inputs below
+  // only render when the merchant actually has them.
+  const hasSettlement = Boolean(merchant.settlementAsset);
   const settle = info(merchant.settlementAsset);
   const canSettings = dashCan(d, "settings");
   const canTeam = dashCan(d, "team");
@@ -797,35 +802,48 @@ export function renderSettings(d: DashData, q: { notice?: string; error?: string
   const profileRows: string[][] = [
     ["Business name", esc(merchant.name)],
     ["Merchant ID", `<span class="mono">${esc(merchant.id)}</span>`],
-    ["Settlement asset", esc(`${settle.symbol} on ${settle.chainName}`)],
-    ["Settlement asset ID", `<span class="mono">${esc(merchant.settlementAsset)}</span>`],
-    ["Settlement address", `<span class="mono">${esc(merchant.settlementAddress)}</span>`],
-    ["Refund address", `<span class="mono">${esc(merchant.refundTo)}</span>`],
+    ...(hasSettlement ? [
+      ["Settlement asset", esc(`${settle.symbol} on ${settle.chainName}`)],
+      ["Settlement asset ID", `<span class="mono">${esc(merchant.settlementAsset)}</span>`],
+      ["Settlement address", `<span class="mono">${esc(merchant.settlementAddress)}</span>`],
+      ["Refund address", `<span class="mono">${esc(merchant.refundTo)}</span>`],
+    ] as string[][] : []),
     ["Platform fee", `${d.feeBps} bps (application setting, applied to quotes)`],
     ["Registered", fmtDate(merchant.createdAt)],
   ];
-  const profileForm = canSettings ? `<h3>Edit profile</h3>
-    <form method="post" action="/dashboard/actions/settings?merchant=${esc(merchant.id)}" class="inline-form">
-      <div class="field"><label for="name">Business name</label><input id="name" name="name" value="${esc(merchant.name)}" required></div>
+  const settlementFormFields = hasSettlement ? `
       <div class="field"><label for="settlementAsset">Settlement asset</label><select id="settlementAsset" name="settlementAsset">${assetOptions(merchant.settlementAsset)}</select></div>
       <div class="field"><label for="settlementAddress">Settlement address</label><input id="settlementAddress" name="settlementAddress" value="${esc(merchant.settlementAddress)}" required></div>
-      <div class="field"><label for="refundTo">Refund address</label><input id="refundTo" name="refundTo" value="${esc(merchant.refundTo)}" required></div>
+      <div class="field"><label for="refundTo">Refund address</label><input id="refundTo" name="refundTo" value="${esc(merchant.refundTo)}" required></div>` : "";
+  const profileForm = canSettings ? `<h3>Edit profile</h3>
+    <form method="post" action="/dashboard/actions/settings?merchant=${esc(merchant.id)}" class="inline-form">
+      <div class="field"><label for="name">Business name</label><input id="name" name="name" value="${esc(merchant.name)}" required></div>${settlementFormFields}
       <button class="btn" type="submit">Save profile</button></form>`
     : READ_ONLY_NOTE;
   // Nuvion link state (fiat slice 2): read only for every role. Each
   // business holds its own entity and accounts at Nuvion; Remiglo
-  // never holds merchant fiat.
+  // never holds merchant fiat. Since the sign up rebuild this card is
+  // also the merchant's business and settlement home: the business
+  // profile fields collected at creation show here when present.
+  const businessRows: string[][] = [
+    ...(merchant.legalName ? [["Legal name", esc(merchant.legalName)]] as string[][] : []),
+    ...(merchant.registrationNumber ? [["Registration number", `<span class="mono">${esc(merchant.registrationNumber)}</span>`]] as string[][] : []),
+    ...(merchant.country ? [["Country", esc(merchant.country)]] as string[][] : []),
+  ];
   const nuvionAccountRows: string[][] = Object.entries(merchant.nuvionAccounts ?? {})
     .map(([currency, accountId]) => [`${esc(currency)} account`, `<span class="mono">${esc(accountId)}</span>`]);
-  const nuvionRows: string[][] = merchant.nuvionEntityId
-    ? [
-        ["Entity ID", `<span class="mono">${esc(merchant.nuvionEntityId)}</span>`],
-        ["Entity status", merchant.nuvionEntityStatus ? chip(merchant.nuvionEntityStatus) : esc("Unknown")],
-        ...(nuvionAccountRows.length > 0
-          ? nuvionAccountRows
-          : [["Accounts", esc("None yet. Accounts open once the entity is approved.")]]),
-      ]
-    : [["Status", esc("Not linked")]];
+  const nuvionRows: string[][] = [
+    ...businessRows,
+    ...(merchant.nuvionEntityId
+      ? [
+          ["Entity ID", `<span class="mono">${esc(merchant.nuvionEntityId)}</span>`],
+          ["Entity status", merchant.nuvionEntityStatus ? chip(merchant.nuvionEntityStatus) : esc("Unknown")],
+          ...(nuvionAccountRows.length > 0
+            ? nuvionAccountRows
+            : [["Accounts", esc("None yet. Accounts open once the entity is approved.")]]),
+        ] as string[][]
+      : [["Status", esc("Not linked")]] as string[][]),
+  ];
   const nuvionCard = card("Nuvion fiat account", htable(["Field", "Value"], nuvionRows)
     + `<p class="note">Fiat payouts run through Nuvion. This business holds its own entity and accounts there, in its own name; Remiglo runs the operations and never holds the money.</p>`);
   const users = store.listUsers(merchant.id);

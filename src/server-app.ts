@@ -447,13 +447,18 @@ export function buildApp(options: BuildOptions = {}) {
     const back = (params: Record<string, string | undefined>) =>
       dashRedirect(reply, "/dashboard/settings", { merchant: m.id, ...params });
     const b = (req.body ?? {}) as any;
-    if (!b.name || !b.settlementAsset || !b.settlementAddress || !b.refundTo) {
-      return back({ error: "Name, settlement asset, settlement address and refund address are all required." });
+    if (!b.name) {
+      return back({ error: "Name is required." });
     }
-    if (!(await knownAsset(String(b.settlementAsset)))) return back({ error: "That settlement asset is not a known asset." });
+    // Settlement fields fall back to what the merchant already has: a
+    // merchant created name only has none, and saving its profile must
+    // not demand them. When an asset is supplied it must be a known one.
+    const settlementAsset = b.settlementAsset ? String(b.settlementAsset) : m.settlementAsset;
+    if (settlementAsset && !(await knownAsset(settlementAsset))) return back({ error: "That settlement asset is not a known asset." });
     store.updateMerchant(m.id, {
-      name: String(b.name), settlementAsset: String(b.settlementAsset),
-      settlementAddress: String(b.settlementAddress), refundTo: String(b.refundTo),
+      name: String(b.name), settlementAsset,
+      settlementAddress: b.settlementAddress ? String(b.settlementAddress) : m.settlementAddress,
+      refundTo: b.refundTo ? String(b.refundTo) : m.refundTo,
     });
     return back({ notice: "Business profile saved." });
   });
@@ -834,10 +839,26 @@ export function buildApp(options: BuildOptions = {}) {
       return reply.code(401).send({ error: "merchant creation requires the admin token" });
     }
     const b = req.body as any;
-    if (!b?.name || !b?.settlementAsset || !b?.settlementAddress || !b?.refundTo) {
-      return reply.code(400).send({ error: "name, settlementAsset, settlementAddress and refundTo are required" });
+    if (!b?.name) {
+      return reply.code(400).send({ error: "name is required" });
     }
-    const created = store.createMerchant(b);
+    // Settlement fields are optional since the sign up rebuild: they
+    // belong to the retired invoice rail, and a merchant created with
+    // a name alone settles through Nuvion. When a settlement asset IS
+    // given it must be a known asset, the same check the dashboard
+    // settings path has always applied.
+    if (b.settlementAsset && !(await knownAsset(String(b.settlementAsset)))) {
+      return reply.code(400).send({ error: "That settlement asset is not a known asset." });
+    }
+    const created = store.createMerchant({
+      name: String(b.name),
+      settlementAsset: b.settlementAsset ? String(b.settlementAsset) : undefined,
+      settlementAddress: b.settlementAddress ? String(b.settlementAddress) : undefined,
+      refundTo: b.refundTo ? String(b.refundTo) : undefined,
+      legalName: b.legalName ? String(b.legalName) : undefined,
+      registrationNumber: b.registrationNumber ? String(b.registrationNumber) : undefined,
+      country: b.country ? String(b.country) : undefined,
+    });
     const merchant = await linkMerchantToNuvion(created.merchant);
     return reply.code(201).send({ merchant, apiKey: created.apiKey, note: "Store this API key now. It is shown once and only its hash is kept." });
   });
@@ -904,6 +925,9 @@ export function buildApp(options: BuildOptions = {}) {
   app.get("/v1/tokens", async () => intents.tokens());
 
   // ---- invoices ----
+  /** An invoice request refused before any quote: the merchant has no settlement asset for the legacy rail. The API maps it to a 400. */
+  class InvoiceUnavailable extends Error {}
+
   /** The one invoice creation path: quote, store, ledger. API and dashboard both call this. */
   const createInvoiceFor = async (m: Merchant, fields: {
     amount: string; externalRef?: string; currency?: string;
@@ -911,6 +935,13 @@ export function buildApp(options: BuildOptions = {}) {
     idempotencyKey?: string;
   }) => {
     const settlementAsset = fields.settlementAsset ?? m.settlementAsset;
+    // Invoices settle on the retired NEAR Intents rail and cannot
+    // exist without a settlement asset. A merchant created name only
+    // (the Nuvion sign up) has none: refuse clearly here, in the one
+    // creation path, instead of quoting against an empty asset.
+    if (!settlementAsset) {
+      throw new InvoiceUnavailable("This merchant has no settlement asset configured, so invoices are unavailable. Invoices settle on the legacy NEAR Intents rail, which requires a settlement asset; Nuvion payouts are unaffected.");
+    }
     const settlementAddress = fields.settlementAddress ?? m.settlementAddress;
     const refundTo = fields.refundTo ?? m.refundTo;
     const originAsset = fields.originAsset ?? settlementAsset;
@@ -957,6 +988,7 @@ export function buildApp(options: BuildOptions = {}) {
         },
       });
     } catch (err) {
+      if (err instanceof InvoiceUnavailable) return reply.code(400).send({ error: err.message });
       return reply.code(502).send({ error: `quote failed: ${err instanceof Error ? err.message : String(err)}` });
     }
   });

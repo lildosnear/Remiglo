@@ -3,9 +3,18 @@ import { createHmac } from "node:crypto";
 export interface Merchant {
   id: string;
   name: string;
+  /** Legacy NEAR Intents settlement asset. Empty string when the merchant was created name only and never configured the retired rail. */
   settlementAsset: string;
+  /** Legacy settlement address. Empty string under the same condition as settlementAsset. */
   settlementAddress: string;
+  /** Legacy refund address. Empty string under the same condition as settlementAsset. */
   refundTo: string;
+  /** Business profile (sign up rebuild): the merchant's legal name as registered, when provided at creation. Onboarding record only; never sent to Nuvion. */
+  legalName?: string;
+  /** Business profile: the merchant's business registration number, when provided at creation. */
+  registrationNumber?: string;
+  /** Business profile: the merchant's country of registration, when provided at creation. */
+  country?: string;
   createdAt: string;
   /** Nuvion child entity link (fiat slice 2). Absent until a link is attempted. */
   nuvionEntityId?: string;

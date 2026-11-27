@@ -44,13 +44,15 @@ In another terminal:
 curl http://127.0.0.1:8400/health
 
 # Create a merchant (the API key is returned once; only its hash is stored).
-# The settlement fields belong to the retired NEAR rail and are kept for
-# compatibility; the Nuvion link created alongside is what settles payouts now.
+# A name is all sign up needs: creation also creates the merchant's Nuvion
+# child entity, and the refresh call below opens its currency accounts.
+# Optional business profile fields (legalName, registrationNumber, country)
+# are stored on the merchant record. The settlement fields of the retired
+# NEAR rail (settlementAsset, settlementAddress, refundTo) remain accepted
+# for merchants that still use the legacy invoice flow; a settlement asset,
+# when given, must be a known asset.
 curl -X POST http://127.0.0.1:8400/v1/merchants -H 'content-type: application/json' -d '{
-  "name": "Demo Business",
-  "settlementAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
-  "settlementAddress": "demo.near",
-  "refundTo": "demo.near"
+  "name": "Demo Business"
 }'
 # -> { "merchant": {...}, "apiKey": "rgl_live_..." }
 export KEY=rgl_live_...
@@ -79,7 +81,7 @@ curl -X POST http://127.0.0.1:8400/v1/recipients -H "authorization: Bearer $KEY"
   "accountNumber": "0123456789", "accountName": "Yusuf Bello",
   "country": "NG", "currency": "NGN"
 }'
-# -> { "recipient": { "id": "rcp_...", ... } }
+# -> { "id": "rcp_...", "kind": "bank", ... }
 export RECIPIENT_ID=rcp_...
 ```
 
@@ -132,7 +134,7 @@ Cadences: weekly (every 7 days), biweekly (every 14 days), monthly (same day of 
 
 ## 7. Invoices
 
-Invoices and the hosted payment page at `/pay/:invoiceId` belong to the retired NEAR Intents rail and remain available for that flow. Fiat invoicing is a later phase: bank inflows cannot yet be matched to invoices reliably, so the current product is payouts first. Nothing in the payout, batch or reconciliation flows depends on invoices.
+Invoices and the hosted payment page at `/pay/:invoiceId` belong to the retired NEAR Intents rail and remain available for that flow. They need a settlement asset on the merchant: a merchant created with a name alone has none, and invoice creation for it answers a clear 400 rather than quoting against nothing. Fiat invoicing is a later phase: bank inflows cannot yet be matched to invoices reliably, so the current product is payouts first. Nothing in the payout, batch or reconciliation flows depends on invoices.
 
 ## 8. Use the SDK
 
@@ -181,7 +183,7 @@ Safety rails: `PILOT_MAX_PAYOUT_UNITS` caps every payout (default 100000000), ba
 
 ## API surface
 
-- Merchants: `POST /v1/merchants` (admin token when `ADMIN_TOKEN` is set; API key returned once), `GET /v1/merchants/me`, `POST /v1/merchants/:id/nuvion/refresh` (mirrors the entity status; opens currency accounts on approval).
+- Merchants: `POST /v1/merchants` (admin token when `ADMIN_TOKEN` is set; API key returned once; only `name` is required, with optional business profile and legacy settlement fields), `GET /v1/merchants/me`, `POST /v1/merchants/:id/nuvion/refresh` (mirrors the entity status; opens currency accounts on approval).
 - Recipients: `POST|GET /v1/recipients`, `GET|PATCH|DELETE /v1/recipients/:id`. Kinds: `bank`, `momo`, `wallet`.
 - Payouts: `POST|GET /v1/payouts`, `GET /v1/payouts/:id`, `POST /v1/payouts/:id/retry` (a failed payout only; the retry is a fresh payout with a fresh reference, linked to the failed one).
 - Batches: `POST|GET /v1/payout-batches` (JSON rows or raw `text/csv`), `GET /v1/payout-batches/:id`, `POST /v1/payout-batches/:id/approve`.

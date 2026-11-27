@@ -1,9 +1,14 @@
 /**
- * Nuvion client: Remiglo's fiat rail, shaped like the Intents client in
- * intents.ts (typed interface, real fetch implementation, deterministic
- * mock, getNuvionClient switch). Slice 1 of the fiat mode build; nothing
- * in the server wires this in yet. Spec: the Nuvion integration map in
- * the stablecoin rails goal files.
+ * Nuvion client: Remiglo's settlement rail for fiat and stablecoin
+ * payouts, shaped like the Intents client in intents.ts (typed
+ * interface, real fetch implementation, deterministic mock,
+ * getNuvionClient switch). It is wired through the server: merchant
+ * sign up creates a child entity and stores the link, recipients link
+ * counterparties and payment details, payout execution creates
+ * transfers for bank, mobile money and wallet rows, the inbound
+ * webhook receiver records outflow events, and the sync loop applies
+ * their transitions with a polling pass as backstop. Spec: the Nuvion
+ * integration map in the stablecoin rails goal files.
  *
  * Wire format follows Nuvion's public docs (docs.nuvion.co): snake_case
  * field names, amounts as numbers in the smallest currency unit, and

@@ -28,6 +28,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS merchants (
   id TEXT PRIMARY KEY, name TEXT NOT NULL,
   settlement_asset TEXT NOT NULL, settlement_address TEXT NOT NULL, refund_to TEXT NOT NULL,
+  legal_name TEXT, registration_number TEXT, country TEXT,
   nuvion_entity_id TEXT, nuvion_entity_status TEXT, nuvion_accounts TEXT,
   created_at TEXT NOT NULL
 );
@@ -182,6 +183,14 @@ export class Store {
         this.db.exec(`ALTER TABLE merchants ADD COLUMN ${col} TEXT`);
       }
     }
+    // Migration for databases created before the sign up rebuild: the
+    // optional business profile fields collected at merchant creation.
+    // All nullable; merchants created before this have no profile.
+    for (const col of ["legal_name", "registration_number", "country"]) {
+      if (!merchantCols.some((c) => c.name === col)) {
+        this.db.exec(`ALTER TABLE merchants ADD COLUMN ${col} TEXT`);
+      }
+    }
     // Migration for databases created before recipient kinds existed
     // (fiat slice 3): the kind, the bank and mobile money detail
     // columns, the wallet network, and the Nuvion counterparty link.
@@ -198,13 +207,26 @@ export class Store {
   close() { this.db.close(); }
 
   // ---- merchants and keys ----
-  createMerchant(input: { name: string; settlementAsset: string; settlementAddress: string; refundTo: string }) {
+  createMerchant(input: {
+    name: string; settlementAsset?: string; settlementAddress?: string; refundTo?: string;
+    legalName?: string; registrationNumber?: string; country?: string;
+  }) {
     const merchant: Merchant = {
-      id: uid("mch"), name: input.name, settlementAsset: input.settlementAsset,
-      settlementAddress: input.settlementAddress, refundTo: input.refundTo, createdAt: now(),
+      id: uid("mch"), name: input.name,
+      // The settlement fields belong to the retired NEAR Intents rail
+      // and are optional since the sign up rebuild: a merchant created
+      // with a name alone stores empty strings (the columns stay NOT
+      // NULL, as they have always been), and the invoice guard treats
+      // an empty settlement asset as "not configured".
+      settlementAsset: input.settlementAsset ?? "",
+      settlementAddress: input.settlementAddress ?? "",
+      refundTo: input.refundTo ?? "",
+      legalName: input.legalName, registrationNumber: input.registrationNumber, country: input.country,
+      createdAt: now(),
     };
-    this.db.prepare("INSERT INTO merchants (id,name,settlement_asset,settlement_address,refund_to,created_at) VALUES (?,?,?,?,?,?)")
-      .run(merchant.id, merchant.name, merchant.settlementAsset, merchant.settlementAddress, merchant.refundTo, merchant.createdAt);
+    this.db.prepare("INSERT INTO merchants (id,name,settlement_asset,settlement_address,refund_to,legal_name,registration_number,country,created_at) VALUES (?,?,?,?,?,?,?,?,?)")
+      .run(merchant.id, merchant.name, merchant.settlementAsset, merchant.settlementAddress, merchant.refundTo,
+        merchant.legalName ?? null, merchant.registrationNumber ?? null, merchant.country ?? null, merchant.createdAt);
     const apiKey = newApiKey();
     this.db.prepare("INSERT INTO api_keys (id,merchant_id,key_hash,prefix,created_at) VALUES (?,?,?,?,?)")
       .run(uid("key"), merchant.id, hashKey(apiKey), apiKey.slice(0, 12), merchant.createdAt);
@@ -214,6 +236,7 @@ export class Store {
   merchantByApiKey(apiKey: string): Merchant | undefined {
     const row = this.db.prepare(
       `SELECT m.id, m.name, m.settlement_asset, m.settlement_address, m.refund_to, m.created_at,
+              m.legal_name, m.registration_number, m.country,
               m.nuvion_entity_id, m.nuvion_entity_status, m.nuvion_accounts
        FROM api_keys k JOIN merchants m ON m.id = k.merchant_id WHERE k.key_hash = ?`
     ).get(hashKey(apiKey)) as any;
@@ -326,6 +349,9 @@ export class Store {
   private rowMerchant(r: any): Merchant {
     return {
       id: r.id, name: r.name, settlementAsset: r.settlement_asset, settlementAddress: r.settlement_address, refundTo: r.refund_to, createdAt: r.created_at,
+      legalName: r.legal_name ?? undefined,
+      registrationNumber: r.registration_number ?? undefined,
+      country: r.country ?? undefined,
       nuvionEntityId: r.nuvion_entity_id ?? undefined,
       nuvionEntityStatus: r.nuvion_entity_status ?? undefined,
       nuvionAccounts: r.nuvion_accounts ? (JSON.parse(r.nuvion_accounts) as Record<string, string>) : undefined,
