@@ -62,9 +62,14 @@ per payout, on its first transition into an in flight state.
 Everything Remiglo itself enforces lives here, in Remiglo's own code:
 spending caps per payout, the batch approval threshold, dashboard roles
 (owner, admin, operator, viewer) with operators unable to approve, and
-the ledger that records every money event. There is no contract
-enforced policy layer in the current product; the receipt for a payment
-is the ledger entry plus the provider reference Nuvion returns.
+the ledger that records every money event. Approvals follow maker and
+checker separation: every batch records who created it and who approved
+it, and a batch cannot be approved by the dashboard user who created
+it, so a second approver has to release it. API approvals carry no
+human identity and are the documented exception to that rule. There is
+no contract enforced policy layer in the current product; the receipt
+for a payment is the ledger entry plus the provider reference Nuvion
+returns.
 
 All state lives in one SQLite database (WAL mode) at `REMIGLO_DB`. The
 store (`src/lib/store.ts`) owns schema and migrations, which are

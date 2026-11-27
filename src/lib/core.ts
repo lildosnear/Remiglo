@@ -191,6 +191,14 @@ export interface PayoutBatch {
   /** Registry anchoring (Slice G): none | pending | anchored | failed. */
   anchorTxHash?: string | null;
   anchorStatus?: string;
+  /**
+   * Maker and checker separation: who created the batch and who
+   * approved it. A dashboard user id, or the literal "api" or
+   * "schedule" for the non human creation paths. Undefined on batches
+   * recorded before actor tracking existed.
+   */
+  createdBy?: string;
+  approvedBy?: string;
   createdAt: string;
   updatedAt?: string;
 }

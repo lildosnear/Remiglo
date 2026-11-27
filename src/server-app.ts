@@ -314,7 +314,7 @@ export function buildApp(options: BuildOptions = {}) {
   };
   const dashData = (merchant: Merchant, req?: FastifyRequest): DashData => ({
     store, merchant, feeBps: cfg.appFeeBps, pilotMaxPayoutUnits: cfg.pilotMaxPayoutUnits,
-    role: req?.dashUser?.role, userEmail: req?.dashUser?.email,
+    role: req?.dashUser?.role, userEmail: req?.dashUser?.email, userId: req?.dashUser?.id,
   });
   const dashRedirect = (reply: FastifyReply, path: string, params: Record<string, string | undefined>) => {
     const qs = Object.entries(params).filter(([, v]) => v)
@@ -521,9 +521,13 @@ export function buildApp(options: BuildOptions = {}) {
     const m = store.getMerchant(batch.merchantId);
     if (!m) return dashRedirect(reply, "/dashboard/payouts", { error: "The merchant for this batch no longer exists." });
     try {
-      await approveBatchFor(m, batch);
+      await approveBatchFor(m, batch, req.dashUser?.id);
       return dashRedirect(reply, detailPath, { merchant: batch.merchantId, notice: "Batch approved. Its payouts are quoted and awaiting funding." });
     } catch (err) {
+      // Maker and checker refusal is a 403 in its own right, in the
+      // same JSON shape the dashboard action guard answers with, not
+      // a redirect with a banner.
+      if (err instanceof ApprovalRefused) return reply.code(err.httpStatus).send({ error: err.message });
       return dashRedirect(reply, detailPath, { merchant: batch.merchantId, error: `Approval failed: ${err instanceof Error ? err.message : String(err)}` });
     }
   });
@@ -671,7 +675,7 @@ export function buildApp(options: BuildOptions = {}) {
       if (problem) return back({ error: problem });
       resolvedRows.push(resolved.row);
     }
-    const { batch, quoteError } = await createBatchFor(m, resolvedRows);
+    const { batch, quoteError } = await createBatchFor(m, resolvedRows, req.dashUser?.id);
     if (quoteError) return back({ error: `Quote failed: ${quoteError}` });
     return back({
       notice: batch.status === "pending_approval"
@@ -1486,6 +1490,11 @@ export function buildApp(options: BuildOptions = {}) {
     constructor(message: string, readonly httpStatus = 409) { super(message); }
   }
 
+  /** An approval the product refuses, with the HTTP status the routes answer. */
+  class ApprovalRefused extends Error {
+    constructor(message: string, readonly httpStatus = 403) { super(message); }
+  }
+
   /**
    * The one payout retry path. Only a failed payout can be retried. The
    * retry is a fresh quote and a new payout linked to the failed one,
@@ -1625,12 +1634,12 @@ export function buildApp(options: BuildOptions = {}) {
    * addresses were never returned in a success response, so nothing can
    * be funded against them.
    */
-  const createBatchFor = async (m: Merchant, rows: any[]) => {
+  const createBatchFor = async (m: Merchant, rows: any[], createdBy?: string) => {
     const total = rows.reduce((acc: bigint, r: any) => acc + BigInt(String(r.amount)), 0n);
     const needsApproval = total > BigInt(cfg.approvalThresholdUnits);
     const batch = store.createBatch({
       id: makeId("batch"), merchantId: m.id, status: needsApproval ? "pending_approval" : "active",
-      totalAmount: total.toString(), rowCount: rows.length, rows,
+      totalAmount: total.toString(), rowCount: rows.length, rows, createdBy,
       createdAt: new Date().toISOString(),
     });
     store.addLedger({ merchantId: m.id, entityType: "batch", entityId: batch.id, kind: "batch_created", amount: total.toString(), asset: String(rows[0].destinationAsset ?? "") });
@@ -1680,7 +1689,7 @@ export function buildApp(options: BuildOptions = {}) {
       if (problem) return reply.code(400).send({ error: problem });
       resolvedRows.push(resolved.row);
     }
-    const { batch, payouts, quoteError } = await createBatchFor(m, resolvedRows);
+    const { batch, payouts, quoteError } = await createBatchFor(m, resolvedRows, "api");
     if (quoteError) {
       return reply.code(502).send({ error: `quote failed: ${quoteError}`, batch });
     }
@@ -1696,8 +1705,27 @@ export function buildApp(options: BuildOptions = {}) {
     return { ...batch, payouts: store.listPayouts(m.id, batch.id), totals: { totalAmount: batch.totalAmount, rowCount: batch.rowCount } };
   });
 
-  /** The one batch approval path: quote every row, mark active, ledger. API and dashboard both call this. */
-  const approveBatchFor = async (m: Merchant, batch: PayoutBatch) => {
+  /**
+   * The one batch approval path: quote every row, mark active, ledger.
+   * API and dashboard both call this. `approver` records who released
+   * the batch: a dashboard user id, or the literal "api".
+   */
+  const approveBatchFor = async (m: Merchant, batch: PayoutBatch, approver?: string) => {
+    // Maker and checker separation: a dashboard user who created a
+    // batch cannot be the one who approves it; a different owner or
+    // admin has to release it. The check lives here, in the one
+    // approval path, so every caller inherits it. It can only bite
+    // when the approver is a dashboard user id, which is the one
+    // value a batch's createdBy can also hold for the same person.
+    // API approvals pass the literal "api" and are never blocked: an
+    // API key carries no human identity to compare against the
+    // creator, so this rule cannot cover them. That is a documented
+    // limit of the rule, not an oversight. Batches recorded before
+    // actor tracking existed have no creator on file and are likewise
+    // not blocked.
+    if (approver && approver !== "api" && batch.createdBy && approver === batch.createdBy) {
+      throw new ApprovalRefused("You created this batch, so you cannot approve it. Maker and checker separation requires a different approver: another owner or admin must release it.");
+    }
     const payouts: Payout[] = [];
     // Re approval after a part failed attempt: a row that already
     // executed through Nuvion carries a provider_ref and a live
@@ -1733,7 +1761,7 @@ export function buildApp(options: BuildOptions = {}) {
       failAttemptPayouts(payouts);
       throw err;
     }
-    const updated = store.updateBatch(batch.id, { status: "active" })!;
+    const updated = store.updateBatch(batch.id, { status: "active", approvedBy: approver })!;
     store.addLedger({ merchantId: m.id, entityType: "batch", entityId: batch.id, kind: "batch_approved", amount: batch.totalAmount, asset: String((batch.rows[0] as any)?.destinationAsset ?? "") });
     // First anchor for a batch that waited for approval.
     anchorBatchNow(updated, batch.rows as unknown as PayoutRow[]);
@@ -1746,9 +1774,10 @@ export function buildApp(options: BuildOptions = {}) {
     if (!batch) return reply.code(404).send({ error: "batch not found" });
     if (batch.status !== "pending_approval") return reply.code(409).send({ error: `batch is ${batch.status}, not pending approval` });
     try {
-      const { batch: updated, payouts } = await approveBatchFor(m, batch);
+      const { batch: updated, payouts } = await approveBatchFor(m, batch, "api");
       return { ...updated, payouts };
     } catch (err) {
+      if (err instanceof ApprovalRefused) return reply.code(err.httpStatus).send({ error: err.message });
       return reply.code(502).send({ error: `quote failed: ${err instanceof Error ? err.message : String(err)}` });
     }
   });
@@ -1846,7 +1875,13 @@ export function buildApp(options: BuildOptions = {}) {
     return { rows: out };
   };
 
-  const scheduleServices: ScheduleServices = { createInvoiceFor, createBatchFor, prepareBatchRows };
+  const scheduleServices: ScheduleServices = {
+    createInvoiceFor,
+    // Batches a schedule creates are recorded as created by "schedule":
+    // no human made them, so no dashboard approver is ever their maker.
+    createBatchFor: (m, rows) => createBatchFor(m, rows, "schedule"),
+    prepareBatchRows,
+  };
 
   const validSchedulePayload = (m: Merchant, kind: string, payload: any): string | undefined => {
     if (!payload || typeof payload !== "object") return "payload must be an object";

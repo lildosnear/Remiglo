@@ -20,6 +20,8 @@ export interface DashData {
   /** Signed in dashboard role. Undefined means pre account operator mode (no users exist yet). */
   role?: DashRole;
   userEmail?: string;
+  /** Signed in dashboard user id. Used to recognise a batch's creator. */
+  userId?: string;
 }
 
 /** Role check for renderers: pre account mode (no users) keeps full operator access. */
@@ -208,12 +210,15 @@ export function renderOverview(d: DashData, q: { notice?: string; error?: string
     ? `<p class="empty">No batches are waiting for approval.</p>`
     : htable(["Batch", "Rows", "Total", "Created", ""], pendingBatches.map((b) => {
       const firstAsset = String((b.rows[0] as any)?.destinationAsset ?? merchant.settlementAsset);
+      const selfCreated = Boolean(d.userId && b.createdBy && b.createdBy === d.userId);
       return [
         `<a href="/dashboard/payouts/batches/${esc(b.id)}?merchant=${esc(merchant.id)}"><span class="mono">${esc(b.id)}</span></a>`, String(b.rowCount),
         esc(formatAmount(b.totalAmount, info(firstAsset))), fmtDate(b.createdAt),
-        canApprove
-          ? `<form method="post" action="/dashboard/actions/batches/${esc(b.id)}/approve" style="margin:0"><button class="btn small" type="submit">Approve</button></form>`
-          : `<span class="note">Approval needs an admin or owner role</span>`,
+        selfCreated
+          ? `<span class="note">You created this batch; another approver must release it</span>`
+          : canApprove
+            ? `<form method="post" action="/dashboard/actions/batches/${esc(b.id)}/approve" style="margin:0"><button class="btn small" type="submit">Approve</button></form>`
+            : `<span class="note">Approval needs an admin or owner role</span>`,
       ];
     }));
   const content = `
@@ -311,6 +316,14 @@ export function renderBatchDetail(d: DashData, batch: PayoutBatch, q: { notice?:
   const settledRows = rows.filter((p) => p.status === "settled");
   const settledTotal = settledRows.reduce((a, p) => a + BigInt(p.amount), 0n);
 
+  // Actor display for maker and checker: dashboard user ids resolve
+  // to the user's email; the non human actors show as themselves.
+  const actorLabel = (actor?: string): string => {
+    if (!actor) return "—";
+    if (actor === "api" || actor === "schedule") return actor;
+    return store.getUser(actor)?.email ?? actor;
+  };
+
   const summary = htable(["Field", "Value"], [
     ["Batch", `<span class="mono">${esc(batch.id)}</span>`],
     ["Status", chip(batch.status)],
@@ -318,13 +331,21 @@ export function renderBatchDetail(d: DashData, batch: PayoutBatch, q: { notice?:
     ["Rows", String(batch.rowCount)],
     ["Settled so far", `${settledRows.length} of ${rows.length} rows, ${esc(formatAmount(settledTotal.toString(), info(firstAsset)))}`],
     ["Created", fmtDate(batch.createdAt)],
+    ["Created by", esc(actorLabel(batch.createdBy))],
+    ...(batch.approvedBy ? [["Approved by", esc(actorLabel(batch.approvedBy))]] as Array<[string, string]> : []),
     ["Last updated", fmtDate(batch.updatedAt ?? batch.createdAt)],
   ]);
 
   const canApprove = dashCan(d, "approve");
+  // Maker and checker: the signed in creator of a waiting batch is
+  // told plainly that someone else must approve it, and is not
+  // offered an approve control that would only refuse on click.
+  const selfCreated = Boolean(d.userId && batch.createdBy && batch.createdBy === d.userId);
   const approval = batch.status === "pending_approval"
     ? (canApprove
-      ? `<p>This batch is over the approval threshold, so it is waiting before any money moves. Approving releases every row for quoting and funding.</p>
+      ? selfCreated
+        ? `<p>You created this batch, so you cannot approve it. Maker and checker separation means a different approver, an owner or admin who did not create the batch, has to release it before any money moves.</p>`
+        : `<p>This batch is over the approval threshold, so it is waiting before any money moves. Approving releases every row for quoting and funding.</p>
          <form method="post" action="/dashboard/actions/batches/${esc(batch.id)}/approve" style="margin:0"><button class="btn" type="submit">Approve batch</button></form>`
       : `<p>This batch is over the approval threshold and is waiting for approval. Your role can prepare batches but cannot approve them; an admin or the owner has to release it.</p>`)
     : `<p>This batch has been approved. Its rows settle one by one, and the full history is in the activity below.</p>`;

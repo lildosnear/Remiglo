@@ -58,7 +58,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_payout_idem ON payouts(merchant_id, idempo
 CREATE TABLE IF NOT EXISTS payout_batches (
   id TEXT PRIMARY KEY, merchant_id TEXT NOT NULL, status TEXT NOT NULL,
   total_amount TEXT NOT NULL, row_count INTEGER NOT NULL, rows_json TEXT NOT NULL,
-  anchor_tx_hash TEXT, anchor_status TEXT,
+  anchor_tx_hash TEXT, anchor_status TEXT, created_by TEXT, approved_by TEXT,
   created_at TEXT NOT NULL, updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS ledger_entries (
@@ -145,6 +145,15 @@ export class Store {
     }
     if (!batchCols.some((c) => c.name === "anchor_status")) {
       this.db.exec("ALTER TABLE payout_batches ADD COLUMN anchor_status TEXT");
+    }
+    // Migration for databases created before maker and checker
+    // separation: the actor that created the batch and the actor that
+    // approved it (a dashboard user id, or "api" / "schedule").
+    if (!batchCols.some((c) => c.name === "created_by")) {
+      this.db.exec("ALTER TABLE payout_batches ADD COLUMN created_by TEXT");
+    }
+    if (!batchCols.some((c) => c.name === "approved_by")) {
+      this.db.exec("ALTER TABLE payout_batches ADD COLUMN approved_by TEXT");
     }
     // Migration for databases created before payout retries existed.
     const payoutCols = this.db.prepare("PRAGMA table_info(payouts)").all() as Array<{ name: string }>;
@@ -493,8 +502,8 @@ export class Store {
   }
 
   createBatch(b: PayoutBatch) {
-    this.db.prepare(`INSERT INTO payout_batches (id,merchant_id,status,total_amount,row_count,rows_json,anchor_tx_hash,anchor_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .run(b.id, b.merchantId, b.status, b.totalAmount, b.rowCount, JSON.stringify(b.rows), b.anchorTxHash ?? null, b.anchorStatus ?? "none", b.createdAt, b.createdAt);
+    this.db.prepare(`INSERT INTO payout_batches (id,merchant_id,status,total_amount,row_count,rows_json,anchor_tx_hash,anchor_status,created_by,approved_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(b.id, b.merchantId, b.status, b.totalAmount, b.rowCount, JSON.stringify(b.rows), b.anchorTxHash ?? null, b.anchorStatus ?? "none", b.createdBy ?? null, b.approvedBy ?? null, b.createdAt, b.createdAt);
     return this.getBatchById(b.id) ?? b;
   }
 
@@ -520,8 +529,8 @@ export class Store {
     const cur = this.db.prepare("SELECT * FROM payout_batches WHERE id = ?").get(id) as any;
     if (!cur) return undefined;
     const next = { ...this.rowBatch(cur), ...patch, updatedAt: now() };
-    this.db.prepare("UPDATE payout_batches SET status=?, anchor_tx_hash=?, anchor_status=?, updated_at=? WHERE id=?")
-      .run(next.status, next.anchorTxHash ?? null, next.anchorStatus ?? "none", next.updatedAt, id);
+    this.db.prepare("UPDATE payout_batches SET status=?, anchor_tx_hash=?, anchor_status=?, created_by=?, approved_by=?, updated_at=? WHERE id=?")
+      .run(next.status, next.anchorTxHash ?? null, next.anchorStatus ?? "none", next.createdBy ?? null, next.approvedBy ?? null, next.updatedAt, id);
     return next;
   }
 
@@ -530,6 +539,7 @@ export class Store {
       id: r.id, merchantId: r.merchant_id, status: r.status, totalAmount: r.total_amount,
       rowCount: r.row_count, rows: JSON.parse(r.rows_json),
       anchorTxHash: r.anchor_tx_hash ?? null, anchorStatus: r.anchor_status ?? "none",
+      createdBy: r.created_by ?? undefined, approvedBy: r.approved_by ?? undefined,
       createdAt: r.created_at, updatedAt: r.updated_at ?? undefined,
     };
   }
