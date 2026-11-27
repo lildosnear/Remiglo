@@ -1,149 +1,228 @@
 # Remiglo Architecture
 
-Adopted by Desmond on 2026-11-06. This is the stack Remiglo is actually
-being built on, layer by layer, with an honest status for each layer
-today. Nothing in the status map is aspirational: if it says not built,
-it does not exist yet.
+This document describes the system as it stands. It was rewritten on
+2026-11-27, after the pivot of 2026-11-25 moved Remiglo onto Nuvion as
+its settlement foundation and retired the NEAR Intents rail the product
+was first built on. Nothing in the status map is aspirational: if it
+says built against a mock, it has not yet run against the live provider,
+and it says so.
 
-## The six layers
+The detailed design record for the Nuvion integration (flows, status
+mapping, the sharp edges and the open questions for Nuvion) is the
+Nuvion integration map kept with the project's goal files. The original
+architecture, adopted 2026-11-06 for the NEAR build, is preserved in
+this repository's history and summarised in the README's project
+history section.
+
+## The system today
 
 ```
-REMIGLO — Business Payments Infrastructure
+REMIGLO — Business payout operations
 
 1. Developer API + SDK
-   Invoices · Batch payouts · Webhooks · Scheduling
+   Merchants · Recipients · Payouts · Batches · Schedules · Webhooks
 
-2. NEAR Smart Contracts
-   Authorization · Spending policies · Batch records · Audit events
+2. Operations core
+   Store (SQLite) · Ledger · Policies and approvals · One transition path
 
-3. NEAR Intents
-   Cross-chain routing and settlement
+3. Settlement foundation: Nuvion
+   Child entities · Currency accounts · Counterparties · FX quotes · Transfers
 
-4. Chain Signatures
-   Cross-chain signing where needed
+4. Monitoring
+   Sync loop · Inbound webhook receiver · Polling backstop
 
-5. Payment monitoring and indexing
-   QueryAPI · NEAR RPC · 1Click status tracking · Database
-
-6. Business dashboard and accounting reports
+5. Business dashboard and accounting reports
 ```
 
 ### 1. Developer API + SDK
-The product surface businesses integrate against. Merchants create
-invoices, run batch payouts, receive signed webhooks for every status
-change, and set up recurring schedules for payroll, retainers and
-contributor payouts. A hosted payment page hangs off this layer so a
-merchant can share a link instead of integrating. The TypeScript SDK
+
+The product surface businesses integrate against. A merchant is created
+with a name and an optional business profile (legal name, registration
+number, country); creation returns an API key once, and only its hash
+is stored. The address book holds recipients of three kinds: bank
+accounts, mobile money wallets, and stablecoin wallets on the four
+networks Nuvion carries. Payouts are created singly, in batches (JSON
+rows or a raw CSV upload), from the dashboard, or by recurring
+schedules, and every route runs through the same preparation and
+validation code. Rows can carry the payer's own reference and a
+certified breakdown (gross, retention, deductions), which the server
+checks arithmetically before anything is created. The TypeScript SDK
 lives in `sdk/` (package name `remiglo-sdk`): typed methods for
-invoices, payouts, batches (including a CSV string helper), recipients,
-schedules, reconciliation and webhook endpoints, plus a
-verifyWebhookSignature helper.
+merchants, recipients, payouts, batches, schedules, reconciliation and
+webhook endpoints, plus a verifyWebhookSignature helper.
 
 **Webhook events.** invoice.paid, invoice.expired, invoice.refunded,
 invoice.failed, payout.sent, payout.settled, payout.failed,
-batch.completed, schedule.executed. `payout.sent` fires exactly once
-per payout, on the first transition out of the awaiting states
-(awaiting_funding, quoted) into funded or processing; later moves
-(for example funded to processing) do not fire it again.
+batch.completed, schedule.executed. The invoice events belong to the
+retired rail (see Retired components). `payout.sent` fires exactly once
+per payout, on its first transition into an in flight state.
 
-### 2. NEAR Smart Contracts
-The trust layer for anything that must be enforced rather than
-promised: authorization of who may act for a business, spending
-policies (caps, thresholds, approvals), on chain batch records, and
-audit events that a third party can verify without trusting Remiglo's
-database. Built: the Remiglo Registry contract
-(`contracts/registry`, near-sdk 5.29.1) holds owner and merchant
-authorization, per merchant spending policies with a check_spend
-enforcement helper, batch records anchored by payload hash, payout
-anchors counted against the daily budget, and NEP-297 style
-EVENT_JSON audit logs. It is live on NEAR testnet at
-**remiglo.testnet** (top level account, created through the testnet registrar). An earlier first deployment sat on a subaccount of another project; Desmond corrected that the same day, the contract was redeployed to remiglo.testnet, and the subaccount was deleted.
-The API anchors every live batch into it, fire and forget, and stores
-the anchor transaction hash on the batch row.
+### 2. Operations core
 
-### 3. NEAR Intents
-All cross chain routing and settlement. Remiglo speaks to Intents
-through the 1Click API: one quote, one deposit address per payment,
-solvers compete to fulfil, settlement lands in the asset and on the
-chain the recipient chose. Remiglo does not run its own bridges, pools
-or routing.
+Everything Remiglo itself enforces lives here, in Remiglo's own code:
+spending caps per payout, the batch approval threshold, dashboard roles
+(owner, admin, operator, viewer) with operators unable to approve, and
+the ledger that records every money event. There is no contract
+enforced policy layer in the current product; the receipt for a payment
+is the ledger entry plus the provider reference Nuvion returns.
 
-### 4. Chain Signatures
-NEAR controlled accounts that can sign transactions on foreign chains
-through the NEAR MPC network. This is a scalpel, not a second engine:
-it exists for the specific moments where Remiglo itself must produce a
-signature on another chain and no Intents flow covers that act.
+All state lives in one SQLite database (WAL mode) at `REMIGLO_DB`. The
+store (`src/lib/store.ts`) owns schema and migrations, which are
+additive: a PRAGMA column check, then ALTER TABLE ADD COLUMN.
 
-### 5. Payment monitoring and indexing
-How Remiglo knows what happened. The poller tracks every open invoice
-and payout against the 1Click status endpoint and writes each
-transition to the ledger in the database. For the contract layer, an
-RPC polling indexer (`src/services/indexer.ts`) walks blocks from a
-stored cursor, reads the registry contract's EVENT_JSON audit logs
-through NEAR RPC (with an archival endpoint fallback) and stores them
-in the registry_events table exactly once, so audit history can be
-rebuilt from chain data rather than trusted from the database. A
-QueryAPI indexer function is a drop in replacement for the same table
-when a queryapi account is provisioned; no QueryAPI integration exists
-yet and none is faked.
+**One transition path.** Every payout status change, whatever triggered
+it, goes through `applyPayoutTransition` in `src/services/poller.ts`:
+the status write, the ledger entry, the merchant webhook emission and
+batch completion are written in exactly one place, so a settlement
+observed by webhook and one observed by polling are indistinguishable
+in the record.
 
-### 6. Business dashboard and accounting reports
-What the business sees: invoices, payout batches, settlement status,
-the reconciliation ledger, and accounting exports (CSV) that map
-every chain settlement back to the invoice or payout that caused it.
-The dashboard is a full operations console in the design language
-adopted on 2026-11-06 (see docs/DASHBOARD-DESIGN.md), with its own
-accounts and role based permissions: the first run setup creates the
-owner account, and from then on every dashboard page requires a
-login. The API keeps using API keys, unchanged.
+### 3. Settlement foundation: Nuvion
 
-## Boundary rule: Chain Signatures versus Intents
+Nuvion carries the accounts, the currency conversion and the payout
+rails. The client (`src/services/nuvion.ts`) is a typed interface with
+a real fetch implementation and a deterministic mock, switched by
+`NUVION_MOCK`, shaped deliberately like the older Intents client so the
+rest of the system treats rails uniformly.
 
-> **Chain Signatures is only used where Remiglo needs NEAR controlled
-> cross chain signing. Intents handles its own routing and settlement
-> flow. Both are never responsible for the same transaction.**
+- **Entities.** Each merchant maps to a child entity on Nuvion.
+  Creation is attempted at sign up and never blocks it: a failure
+  leaves the merchant unlinked with a ledger entry, and
+  `POST /v1/merchants/:id/nuvion/refresh` mirrors the entity status and,
+  on approval, opens one account per configured currency
+  (`NUVION_CURRENCIES`, default NGN and USD).
+- **Recipients.** At creation, and on later edits that touch payment
+  fields, a recipient is linked to a Nuvion counterparty and a payment
+  detail (bank transfer, mobile money transfer or stablecoin transfer
+  by kind); the ids are stored on the record. Link failure never blocks
+  the address book.
+- **Execution.** A payout bound to a bank, mobile money or network
+  carrying wallet recipient executes at creation for a single payout,
+  or at approval inside a batch. Execution picks the funding account
+  (the payout currency's account when held, otherwise USD or the first
+  account with an FX quote locked for the exact amount), then creates
+  the transfer with the Remiglo payout id as its `unique_reference` and
+  the payment reference as its narration. The payout record exists only
+  once the transfer does.
+- **Status mapping.** Nuvion's transfer statuses map onto Remiglo's in
+  one function: new to sent, pending and processing to processing,
+  successful to settled, failed to failed, cancelled to failed, and
+  reversed to refunded. A transfer that fails never enters refunded;
+  only a completed transfer later reversed does.
+- **Amounts.** Remiglo counts in six decimal smallest units; Nuvion
+  counts at two decimals. One conversion function owns the boundary,
+  and a Nuvion bound amount that is not exact to the cent is refused at
+  creation.
+- **References.** A Nuvion `unique_reference` is single use per entity,
+  forever, and a failed transfer still burns it. Remiglo therefore
+  never reuses one: a retry is a fresh payout with a fresh id, and a
+  payout that already carries a provider reference is never marked
+  failed by a batch attempt failure, because its transfer may still be
+  live and settle.
 
-One transaction, one owner. If Intents accepted a quote and issued a
-deposit address, Intents owns that payment until it succeeds, refunds
-or fails. Remiglo's job in that flow is to watch, record and report,
-never to intervene with its own signatures.
+### 4. Monitoring
 
-**Legitimate use of Chain Signatures.** A business treasury holds funds
-in a NEAR controlled account and must sign a payout deposit on a
-foreign chain, in a case the Intents deposit flow does not cover (for
-example an asset or a destination chain with no 1Click route). The
-treasury's NEAR controlled account signs that one deposit through
-Chain Signatures. No Intents quote exists for that payment, so nothing
-is double owned.
+The sync loop (`POLL_SECONDS`) is how Remiglo knows what happened. It
+runs the schedule runner, the legacy Intents pass, and a Nuvion pass.
+The Nuvion pass first drains recorded inbound webhook events, then
+polls every open Nuvion payout as a backstop.
 
-**Forbidden use.** An invoice's payment is already executing inside
-Intents: the customer deposited, solvers are settling. Remiglo must
-not use Chain Signatures to re sign, re route, top up or "help" that
-settlement from the side. If the Intents flow fails, it fails honestly
-as REFUNDED or FAILED in the ledger, and any retry is a brand new
-payment with its own quote and deposit address.
+The inbound receiver (`POST /webhooks/nuvion`) verifies the HMAC
+SHA256 signature when `NUVION_WEBHOOK_SECRET` is configured, records
+the event into the `nuvion_events` table, and answers. It applies
+nothing inside the request. The sync loop treats each event as a
+trigger and reads the transfer's current state from the API, because
+Nuvion's own documentation advises exactly that, offers no replay, and
+blacklists an endpoint that fails delivery three times in a rolling
+24 hour window. The polling backstop means a lost or blacklisted
+webhook delays a settlement by at most one cycle and never loses it.
 
-## Status map, 2026-11-06 (updated after the full build programme)
+### 5. Business dashboard and accounting reports
 
-| Layer | Exists today | Honest status |
+What the business sees, in the design language of
+docs/DASHBOARD-DESIGN.md (light surface, deep navy, one accent, Inter):
+Overview, Payments, Payouts, Recipients, Invoices, Schedules, Routing,
+Reconciliation, Analytics, Developers, Settings. The Routing page shows
+the merchant's Nuvion transfers and its account position (entity status
+and one row per currency account). Settings carries the business
+profile and the Nuvion link state. Reconciliation exports every payout
+with its reference, breakdown, rail, fiat currency and amount, FX quote
+id, provider reference and provider fee.
+
+Dashboard accounts are separate from API keys: the first run setup
+creates the owner, and every page requires a login from then on.
+Passwords are scrypt hashed; session tokens are hashed in httpOnly
+cookies.
+
+## A Nuvion payout, end to end
+
+1. An operator creates a payout (or a batch) against a saved recipient.
+2. Validation runs: amounts, the pilot cap, the breakdown arithmetic,
+   and the Nuvion bound checks (configured, linked, exact to the cent).
+3. A batch over the approval threshold waits for an approver; a single
+   payout executes at once.
+4. Execution links the recipient if needed, locks an FX quote when the
+   funding currency differs, and creates the Nuvion transfer.
+5. The payout's first status lands through the one transition path, and
+   `payout.sent` fires.
+6. Settlement arrives by signed webhook or by the polling backstop;
+   either way the same transition path writes the outcome, fires
+   `payout.settled` or `payout.failed`, and completes the batch when
+   its last row lands.
+7. The row appears in the reconciliation export with its provider
+   reference and fee, ready to match against the business's own books.
+
+## Boundary rules
+
+- **One payout, one rail, one owner.** A Nuvion bound row never touches
+  the Intents quote path, and a legacy row never touches Nuvion. Which
+  rail a row belongs to is decided once, from its recipient, at
+  preparation time.
+- **One transition path.** Status changes are written in one function.
+  Nothing else in the codebase writes a payout status.
+- **Amounts are smallest unit strings.** No floats anywhere near money.
+  The only decimal conversion in the system is the fenced Nuvion
+  boundary function.
+- **Remiglo never holds merchant money.** Balances sit in the
+  merchant's own accounts at the licensed partner. Remiglo's records
+  are operational records, not custody.
+- **Secrets live in environment variables only.** The example env file
+  ships blank. API keys and webhook secrets are shown once at creation
+  and stored hashed.
+
+## Retired components
+
+These remain in the repository as the record of the original build.
+None of them is part of the current product direction, and reviving
+any of them is a new decision, not a configuration change.
+
+- **NEAR Intents rail** (`src/services/intents.ts`, the 1Click API):
+  invoices, the hosted payment page at `/pay/:invoiceId`, and payouts
+  to raw addresses or wallet recipients with no Nuvion network. Still
+  functional against its mock and the live API. A merchant with no
+  settlement asset configured cannot create invoices and is told so in
+  plain words. Fiat invoicing is a later phase: bank inflows cannot yet
+  be matched to invoices reliably.
+- **Remiglo Registry contract** (`contracts/registry`, live on NEAR
+  testnet at remiglo.testnet): merchant authorization, spending
+  policies, batch records and audit events from the NEAR build. Batch
+  anchoring (`src/services/registry.ts`) still runs when configured
+  and is unconfigured by default.
+- **Registry indexer** (`src/services/indexer.ts`): RPC polling of the
+  contract's audit events into `registry_events`. Off by default.
+- **Chain Signatures** (`src/services/chainSignatures.ts`): the NEAR
+  controlled cross chain signing module, inert unless explicitly
+  enabled with a key file. The original boundary rule stands in the
+  code: it refuses any payment carrying an Intents deposit address.
+
+## Status map, 2026-11-27
+
+| Component | Exists today | Honest status |
 |---|---|---|
-| 1. Developer API + SDK | Yes | REST API complete for the discussed scope: merchants, API keys, invoices, hosted payment page, single and batch payouts (JSON or CSV upload) with approval thresholds, a recipients address book, recurring schedules, signed webhooks with retries and replay, reconciliation endpoints. TypeScript SDK built in `sdk/` with typed methods and webhook signature verification, tested against the live app in mock mode. |
-| 2. NEAR Smart Contracts | Yes | Remiglo Registry contract built, unit tested (Rust, 8 tests) and deployed to NEAR testnet at remiglo.testnet: merchant authorization, spending policies with check_spend, batch records, payout anchors, EVENT_JSON audit events. The API anchors batches into it asynchronously (anchor status and tx hash on the batch row) when configured; unconfigured by default. |
-| 3. NEAR Intents | Yes | Integrated through the 1Click API: token list, quotes, deposit addresses, status tracking. A partner API key is still needed for the app fee split. |
-| 4. Chain Signatures | Yes, treasury case only | Module built (`src/services/chainSignatures.ts`) with the boundary enforced in code: it refuses any payment carrying an Intents deposit address. Mock implementation for tests; the live MPC client (v1.signer / v1.signer-prod.testnet) is gated behind CHAIN_SIG_ENABLED plus a configured key file and is inert otherwise. |
-| 5. Monitoring and indexing | Yes | 1Click status tracking by the poller plus the SQLite ledger. Registry indexing by the RPC polling indexer into registry_events with a restart safe cursor; status at GET /v1/internal/indexer/status; events surface on the dashboard Routing page. QueryAPI remains a documented drop in replacement, not built. |
-| 6. Dashboard and reports | Yes | Full business dashboard in the adopted design language (light, navy #14243A, accent #4263EB): Overview, Payments, Payouts, Recipients, Invoices, Schedules, Routing, Reconciliation, Analytics, Developers, Settings. Dashboard accounts with roles (owner, admin, operator, viewer), session login, first run setup, editable business settings and team management. Accounting CSV export. |
-
-## Cross cutting rules
-
-- Amounts are smallest unit strings everywhere. No floats anywhere near
-  money. Fee math is integer basis point math.
-- v1 is non custodial pass through: businesses fund payouts from their
-  own wallets to per payment deposit addresses. Remiglo never pools
-  business funds.
-- NEAR Intents has no testnet. Development runs in mock mode, proofs
-  run as dry quotes, and live amounts stay small and capped in code.
-- Secrets live in environment variables only. The example env file
-  ships blank, and API keys and webhook secrets are shown once at
-  creation and stored hashed or server side only, never on customer
-  facing pages.
+| Developer API + SDK | Yes | Complete for the current scope: merchants with entity linking and business profiles, three recipient kinds, single and batch payouts with approvals and retries, schedules, signed outbound webhooks with retries and replay, reconciliation exports. 178 tests, all passing offline against the mocks. |
+| Nuvion settlement | Built, not yet live verified | Client, entity linking, recipient linking, fiat and stablecoin execution, webhook receiver, polling backstop and reconciliation are built and tested against a deterministic mock written from Nuvion's public documentation. Live verification against the Nuvion sandbox is pending business registration, because Nuvion onboards businesses with verification from the first step. Known unproven points the sandbox run must settle: the entity creation body (name only today), counterparty and payment detail body shapes, the webhook envelope and signature header name, and the units of the provider fee field, which is stored verbatim. |
+| Operations core | Yes | SQLite store with additive migrations, ledger, caps and approval threshold enforced in code, one transition path for all payout status changes. |
+| Monitoring | Yes | Sync loop with schedule runner, Nuvion event drain plus polling backstop, and the legacy Intents pass. |
+| Dashboard and reports | Yes | Full console with role based accounts, Nuvion transfers and account position on Routing, business profile and link state in Settings, and the extended reconciliation export. |
+| NEAR Intents rail | Retired, in code | Invoices and the hosted payment page remain functional; not the product direction. |
+| Registry, indexer, Chain Signatures | Retired, in code | Unconfigured or off by default; kept as the record of the NEAR build. |

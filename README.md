@@ -17,7 +17,7 @@ One batch can pay a bank account in naira, a mobile money wallet in Ghana, and a
 
 ## Status
 
-The Nuvion build is complete and covered by the test suite (170 tests, mock clients for both rails). It is written against Nuvion's public documentation and a deterministic mock of their API. Live verification against the Nuvion sandbox is the remaining step before production use; it waits on business registration, because Nuvion onboards businesses with verification from the first step.
+The Nuvion build is complete and covered by the test suite (178 tests, mock clients for both rails). It is written against Nuvion's public documentation and a deterministic mock of their API. Live verification against the Nuvion sandbox is the remaining step before production use; it waits on business registration, because Nuvion onboards businesses with verification from the first step.
 
 Remiglo began as a NEAR Intents product at NEAR Hackathon 2026. That rail is retired as the product direction; its code, the registry contract and the testnet proofs remain in this repository as the record of that build (see Project history below).
 
@@ -157,7 +157,7 @@ See [sdk/README.md](sdk/README.md) for the full method list.
 
 ## 9. Run the tests
 
-The whole suite runs offline in mock mode (170 tests), plus the Rust contract tests for the historical registry.
+The whole suite runs offline in mock mode (178 tests), plus the Rust contract tests for the historical registry.
 
 ```bash
 npm run typecheck
@@ -213,4 +213,4 @@ Remiglo was first built at NEAR Hackathon 2026 (1 to 14 November 2026) as a stab
 
 On 12 November 2026 the full NEAR money flow ran on testnet against the real Intents verifier, through Tidepool, a community built testnet copy of the 1Click API (not official; test tokens only, but the verifier underneath is real Intents code). An invoice for 2 USDC settled as exactly 1.995824 USDT with the balance verified on chain; a two row batch of 1.0 and 1.4 USDC settled in full and completed; five signed webhooks were delivered; the batch was anchored into the registry: [9wfUv8KtcnC43MiwMZj8PU1umLZ7Rh8aWhTBAzicGsZo](https://testnet.nearblocks.io/txns/9wfUv8KtcnC43MiwMZj8PU1umLZ7Rh8aWhTBAzicGsZo).
 
-The registry contract source is in `contracts/registry` and still builds (`./scripts/build-contract.sh`). When `REGISTRY_CONTRACT_ID`, `REGISTRY_KEY_FILE` and `REGISTRY_MERCHANT_ACCOUNT` are set, the API can still anchor batches into it; the indexer (`INDEXER_SECONDS`, off by default) stores its audit events into `registry_events`. Chain Signatures stays inert unless `CHAIN_SIG_ENABLED=1` with `CHAIN_SIG_KEY_FILE` set. The architecture document in `docs/ARCHITECTURE.md` describes this original build; the Nuvion integration map is the current design record.
+The registry contract source is in `contracts/registry` and still builds (`./scripts/build-contract.sh`). When `REGISTRY_CONTRACT_ID`, `REGISTRY_KEY_FILE` and `REGISTRY_MERCHANT_ACCOUNT` are set, the API can still anchor batches into it; the indexer (`INDEXER_SECONDS`, off by default) stores its audit events into `registry_events`. Chain Signatures stays inert unless `CHAIN_SIG_ENABLED=1` with `CHAIN_SIG_KEY_FILE` set. The current architecture is described in `docs/ARCHITECTURE.md`; the Nuvion integration map is its detailed design record.
